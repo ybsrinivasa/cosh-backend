@@ -1,7 +1,7 @@
 """
-Admin utility endpoints — migration status, health checks.
+Admin utility endpoints — migration status, public visibility, health checks.
 """
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text as sql_text
 from app.database import get_db
@@ -9,6 +9,7 @@ from app.dependencies import require_role
 from app.models.models import (
     UserRole, Core, CoreDataItem, CoreDataTranslation, Connect, ConnectDataItem,
     SimilarityPair, SimilarityStatus, CoreType, StatusEnum, LanguageRegistry,
+    ConnectSchemaPosition,
 )
 from app.neo4j_db import driver
 
@@ -135,3 +136,61 @@ async def migration_status(
             and neo4j_status.get("pg_neo4j_match", False)
         ),
     }
+
+
+# ── Public Visibility (P8-01) ──────────────────────────────────────────────────
+
+@router.get("/public-entities")
+async def list_public_entities(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """List all Cores and Connects currently marked as publicly visible."""
+    public_cores = (await db.execute(
+        select(Core.id, Core.name, Core.folder_id)
+        .where(Core.is_public == True, Core.status == StatusEnum.ACTIVE)
+        .order_by(Core.name)
+    )).all()
+
+    public_connects = (await db.execute(
+        select(Connect.id, Connect.name)
+        .where(Connect.is_public == True, Connect.status == StatusEnum.ACTIVE)
+        .order_by(Connect.name)
+    )).all()
+
+    return {
+        "public_cores": [{"id": r.id, "name": r.name, "folder_id": r.folder_id} for r in public_cores],
+        "public_connects": [{"id": r.id, "name": r.name} for r in public_connects],
+    }
+
+
+@router.put("/cores/{core_id}/visibility")
+async def set_core_visibility(
+    core_id: str,
+    is_public: bool,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Mark a Core as publicly visible (or private) on the knowledge graph."""
+    core = (await db.execute(select(Core).where(Core.id == core_id))).scalar_one_or_none()
+    if not core:
+        raise HTTPException(status_code=404, detail="Core not found")
+    core.is_public = is_public
+    await db.commit()
+    return {"id": core.id, "name": core.name, "is_public": core.is_public}
+
+
+@router.put("/connects/{connect_id}/visibility")
+async def set_connect_visibility(
+    connect_id: str,
+    is_public: bool,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Mark a Connect as publicly visible (or private) on the knowledge graph."""
+    connect = (await db.execute(select(Connect).where(Connect.id == connect_id))).scalar_one_or_none()
+    if not connect:
+        raise HTTPException(status_code=404, detail="Connect not found")
+    connect.is_public = is_public
+    await db.commit()
+    return {"id": connect.id, "name": connect.name, "is_public": connect.is_public}
