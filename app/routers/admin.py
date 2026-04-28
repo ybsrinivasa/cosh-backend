@@ -9,7 +9,7 @@ from app.dependencies import require_role
 from app.models.models import (
     UserRole, Core, CoreDataItem, CoreDataTranslation, Connect, ConnectDataItem,
     SimilarityPair, SimilarityStatus, CoreType, StatusEnum, LanguageRegistry,
-    ConnectSchemaPosition,
+    RelationshipTypeRegistry, ProductRegistry, ConnectSchemaPosition,
 )
 from app.neo4j_db import driver
 
@@ -194,3 +194,36 @@ async def set_connect_visibility(
     connect.is_public = is_public
     await db.commit()
     return {"id": connect.id, "name": connect.name, "is_public": connect.is_public}
+
+
+# ── Registry read endpoints (for frontend) ────────────────────────────────────
+
+@router.get("/registries/languages")
+async def list_languages(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(LanguageRegistry).order_by(LanguageRegistry.language_name_en))
+    return [
+        {"id": l.id, "language_code": l.language_code, "language_name_en": l.language_name_en,
+         "language_name_native": l.language_name_native, "script": l.script,
+         "direction": l.direction.value, "status": l.status.value}
+        for l in result.scalars().all()
+    ]
+
+
+@router.get("/registries/relationship-types")
+async def list_relationship_types(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(RelationshipTypeRegistry).order_by(RelationshipTypeRegistry.label))
+    return [
+        {"id": r.id, "label": r.label, "display_name": r.display_name,
+         "description": r.description, "example": r.example}
+        for r in result.scalars().all()
+    ]
+
+
+@router.get("/registries/products")
+async def list_products(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ProductRegistry).order_by(ProductRegistry.display_name))
+    return [
+        {"id": p.id, "name": p.name, "display_name": p.display_name,
+         "sync_endpoint_url": p.sync_endpoint_url, "status": p.status.value}
+        for p in result.scalars().all()
+    ]
