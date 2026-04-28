@@ -104,3 +104,27 @@ async def update_user_roles(
         select(User).options(selectinload(User.roles)).where(User.id == user_id)
     )
     return result.scalar_one()
+
+
+@router.get("/by-role/{role}", tags=["Admin — Users"])
+async def list_users_by_role(
+    role: UserRole,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_role(UserRole.DESIGNER, UserRole.ADMIN)),
+):
+    """
+    Returns active users with a specific role.
+    Accessible to Designers so they can assign Stockers to Cores/Connects.
+    """
+    result = await db.execute(
+        select(User)
+        .join(UserRoleModel, UserRoleModel.user_id == User.id)
+        .where(
+            UserRoleModel.role == role,
+            UserRoleModel.status == StatusEnum.ACTIVE,
+            User.status == StatusEnum.ACTIVE,
+        )
+        .order_by(User.name)
+    )
+    users = result.scalars().all()
+    return [{"id": u.id, "name": u.name or u.email, "email": u.email} for u in users]
