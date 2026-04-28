@@ -255,7 +255,7 @@ async def create_item(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer_or_stocker),
 ):
-    await get_core(db, core_id)
+    core = await get_core(db, core_id)
 
     existing = (await db.execute(
         select(CoreDataItem).where(
@@ -291,6 +291,11 @@ async def create_item(
         from app.tasks.translation import translate_item
         target_langs = [c.language_code for c in lang_configs]
         translate_item.delay(item.id, item.english_value, target_langs)
+
+    # BL-C-05: trigger targeted similarity check for TEXT cores
+    if core.core_type == CoreType.TEXT:
+        from app.tasks.similarity import check_item_similarity
+        check_item_similarity.delay(item.id)
 
     result = await db.execute(
         select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.id == item.id)
