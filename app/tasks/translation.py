@@ -61,6 +61,21 @@ def translate_item(self, item_id: str, english_value: str, target_langs: list[st
                     validation_status=ValidationStatus.MACHINE_GENERATED,
                 ))
 
+        # BL-C-07: record TRANSLATION_UPDATED in sync_change_log
+        from app.models.models import CoreDataItem, CoreProductTag, SyncChangeLog, EntityType, ChangeType
+        item_row = session.execute(select(CoreDataItem).where(CoreDataItem.id == item_id)).scalar_one_or_none()
+        if item_row:
+            product_ids = session.execute(
+                select(CoreProductTag.product_id).where(CoreProductTag.core_id == item_row.core_id)
+            ).scalars().all()
+            for pid in product_ids:
+                session.add(SyncChangeLog(
+                    product_id=pid,
+                    entity_type=EntityType.TRANSLATION,
+                    entity_id=item_id,
+                    change_type=ChangeType.TRANSLATION_UPDATED,
+                ))
+
         session.commit()
     logger.info(f"Translation complete for item {item_id}")
 

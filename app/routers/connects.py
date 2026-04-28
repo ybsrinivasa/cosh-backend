@@ -19,6 +19,8 @@ from app.services.connect_service import (
     get_connect, check_schema_uniqueness, validate_relationship_type,
     create_neo4j_relationships, inactivate_neo4j_relationships
 )
+from app.services.sync_service import write_sync_changes
+from app.models.models import EntityType, ChangeType
 
 router = APIRouter(prefix="/connects", tags=["Connects"])
 
@@ -299,6 +301,7 @@ async def create_connect_data_item(
     if not connect.schema_finalised:
         connect.schema_finalised = True
 
+    await write_sync_changes(db, EntityType.CONNECT_DATA_ITEM, cdi.id, ChangeType.ADDED, connect_id=connect_id)
     await db.commit()
 
     result = await db.execute(
@@ -331,7 +334,11 @@ async def update_connect_data_status(
     cdi.status = request.status
     if request.status == StatusEnum.INACTIVE:
         inactivate_neo4j_relationships(cdi_id)
+        change = ChangeType.INACTIVATED
+    else:
+        change = ChangeType.REACTIVATED
 
+    await write_sync_changes(db, EntityType.CONNECT_DATA_ITEM, cdi_id, change, connect_id=connect_id)
     await db.commit()
     await db.refresh(cdi)
     return cdi
@@ -450,6 +457,8 @@ async def upload_excel(
             unresolved_count += 1
             unresolved_details.append({"row": row_num, "errors": [f"Neo4J write failed: {str(e)}"]})
             continue
+
+        await write_sync_changes(db, EntityType.CONNECT_DATA_ITEM, cdi.id, ChangeType.ADDED, connect_id=connect_id)
 
         if not connect.schema_finalised:
             connect.schema_finalised = True

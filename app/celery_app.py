@@ -6,7 +6,7 @@ celery_app = Celery(
     "cosh",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.translation", "app.tasks.similarity"],
+    include=["app.tasks.translation", "app.tasks.similarity", "app.tasks.sync"],
 )
 
 celery_app.conf.update(
@@ -18,6 +18,7 @@ celery_app.conf.update(
     task_routes={
         "app.tasks.translation.*": {"queue": "translation"},
         "app.tasks.similarity.*": {"queue": "similarity"},
+        "app.tasks.sync.*": {"queue": "sync"},
     },
     beat_schedule={
         "daily-similarity-scan": {

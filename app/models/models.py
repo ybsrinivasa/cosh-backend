@@ -177,6 +177,7 @@ class CoreProductTag(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     core_id: Mapped[str] = mapped_column(String(36), ForeignKey("cores.id"), nullable=False)
     product_id: Mapped[str] = mapped_column(String(36), ForeignKey("product_registry.id"), nullable=False)
+    entity_type_label: Mapped[str] = mapped_column(String(100), nullable=True)
 
     core: Mapped["Core"] = relationship("Core", back_populates="product_tags")
 
@@ -269,6 +270,7 @@ class ConnectProductTag(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     connect_id: Mapped[str] = mapped_column(String(36), ForeignKey("connects.id"), nullable=False)
     product_id: Mapped[str] = mapped_column(String(36), ForeignKey("product_registry.id"), nullable=False)
+    entity_type_label: Mapped[str] = mapped_column(String(100), nullable=True)
 
     connect: Mapped["Connect"] = relationship("Connect", back_populates="product_tags")
 

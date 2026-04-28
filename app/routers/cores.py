@@ -22,6 +22,8 @@ from app.services.core_service import (
     name_is_unique_for_core, get_core, get_item,
     dual_write_create, dual_write_update_english, inactivity_cascade
 )
+from app.services.sync_service import write_sync_changes
+from app.models.models import EntityType, ChangeType
 
 router = APIRouter(prefix="/cores", tags=["Cores"])
 
@@ -292,6 +294,10 @@ async def create_item(
         target_langs = [c.language_code for c in lang_configs]
         translate_item.delay(item.id, item.english_value, target_langs)
 
+    # BL-C-07: record change for sync
+    await write_sync_changes(db, EntityType.CORE_DATA_ITEM, item.id, ChangeType.ADDED, core_id=core_id)
+    await db.commit()
+
     # BL-C-05: trigger targeted similarity check for TEXT cores
     if core.core_type == CoreType.TEXT:
         from app.tasks.similarity import check_item_similarity
@@ -317,6 +323,7 @@ async def update_item(
 
     item.english_value = request.english_value
     await dual_write_update_english(item_id, request.english_value)
+    await write_sync_changes(db, EntityType.CORE_DATA_ITEM, item_id, ChangeType.UPDATED, core_id=core_id)
     await db.commit()
     await db.refresh(item)
 
@@ -347,7 +354,11 @@ async def update_item_status(
     cascaded = 0
     if request.status == StatusEnum.INACTIVE:
         cascaded = await inactivity_cascade(db, item_id)
+        change = ChangeType.INACTIVATED
+    else:
+        change = ChangeType.REACTIVATED
 
+    await write_sync_changes(db, EntityType.CORE_DATA_ITEM, item_id, change, core_id=core_id)
     await db.commit()
     await db.refresh(item)
     return item
