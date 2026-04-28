@@ -265,9 +265,10 @@ async def list_items(
     core_id: str,
     status_filter: str = "ACTIVE",
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(require_designer_or_stocker),
+    _=Depends(require_designer_or_stocker),
 ):
-    await get_core(db, core_id, current_user)
+    # Read-only: no assignment check — Stockers need items from schema-referenced Cores for dropdowns
+    await get_core(db, core_id)
     q = select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.core_id == core_id)
     if status_filter in ("ACTIVE", "INACTIVE"):
         q = q.where(CoreDataItem.status == StatusEnum(status_filter))
