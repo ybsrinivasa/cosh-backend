@@ -3,7 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.dependencies import require_role, is_stocker_only
-from app.models.models import Folder, Core, UserRole, StatusEnum
+from app.models.models import Folder, Core, Connect, ConnectSchemaPosition, UserRole, StatusEnum
+from sqlalchemy import or_
 from app.schemas.folders import FolderCreate, FolderUpdate, FolderOut
 from app.services.folder_service import name_is_unique, get_folder, folder_is_empty
 
@@ -16,11 +17,31 @@ require_any = require_role(UserRole.DESIGNER, UserRole.STOCKER, UserRole.REVIEWE
 @router.get("", response_model=list[FolderOut])
 async def list_folders(db: AsyncSession = Depends(get_db), current_user=Depends(require_any)):
     if is_stocker_only(current_user):
-        # Stocker sees only folders containing at least one Core assigned to them
+        # Find all Core IDs visible to this Stocker:
+        # - Cores directly assigned to them
+        # - Cores referenced in schemas of Connects assigned to them
+        assigned_connect_ids = (await db.execute(
+            select(Connect.id).where(Connect.assigned_stocker_id == current_user.id)
+        )).scalars().all()
+
+        schema_core_ids: list = []
+        if assigned_connect_ids:
+            schema_core_ids = (await db.execute(
+                select(ConnectSchemaPosition.core_id)
+                .where(ConnectSchemaPosition.connect_id.in_(assigned_connect_ids))
+                .distinct()
+            )).scalars().all()
+
         result = await db.execute(
             select(Folder)
             .join(Core, Core.folder_id == Folder.id)
-            .where(Core.assigned_stocker_id == current_user.id, Core.status == StatusEnum.ACTIVE)
+            .where(
+                Core.status == StatusEnum.ACTIVE,
+                or_(
+                    Core.assigned_stocker_id == current_user.id,
+                    Core.id.in_(schema_core_ids),
+                )
+            )
             .distinct()
             .order_by(Folder.name)
         )

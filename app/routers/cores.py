@@ -10,8 +10,10 @@ from app.dependencies import require_role, is_stocker_only
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
     CoreProductTag, ProductRegistry, LanguageRegistry,
+    Connect, ConnectSchemaPosition,
     UserRole, StatusEnum, CoreType, ValidationStatus
 )
+from sqlalchemy import or_
 from app.schemas.cores import (
     CoreCreate, CoreUpdate, CoreStatusUpdate, CoreOut,
     CoreDataItemCreate, CoreDataItemUpdate, CoreDataItemStatusUpdate,
@@ -35,9 +37,29 @@ require_designer_or_stocker = require_role(UserRole.DESIGNER, UserRole.STOCKER, 
 
 @router.get("", response_model=list[CoreOut])
 async def list_cores(db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
-    q = select(Core).order_by(Core.name)
+    q = select(Core).where(Core.status == StatusEnum.ACTIVE).order_by(Core.name)
     if is_stocker_only(current_user):
-        q = q.where(Core.assigned_stocker_id == current_user.id)
+        # Cores directly assigned to this Stocker
+        # PLUS Cores referenced in schemas of Connects assigned to this Stocker
+        # (Stocker needs these to know what values to put in Excel uploads)
+        assigned_connect_ids = (await db.execute(
+            select(Connect.id).where(Connect.assigned_stocker_id == current_user.id)
+        )).scalars().all()
+
+        schema_core_ids: list = []
+        if assigned_connect_ids:
+            schema_core_ids = (await db.execute(
+                select(ConnectSchemaPosition.core_id)
+                .where(ConnectSchemaPosition.connect_id.in_(assigned_connect_ids))
+                .distinct()
+            )).scalars().all()
+
+        q = q.where(
+            or_(
+                Core.assigned_stocker_id == current_user.id,
+                Core.id.in_(schema_core_ids),
+            )
+        )
     result = await db.execute(q)
     return result.scalars().all()
 
