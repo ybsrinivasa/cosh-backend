@@ -351,7 +351,7 @@ async def upload_excel(
     connect_id: str,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(require_designer),
+    current_user=Depends(require_designer_or_stocker),
 ):
     try:
         import openpyxl

@@ -371,7 +371,7 @@ async def upload_csv(
     core_id: str,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(require_designer),
+    current_user=Depends(require_designer_or_stocker),
 ):
     """
     P2-06 / P7-02: Bulk CSV upload for TEXT cores.
