@@ -1,6 +1,7 @@
 import csv
 import io
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -156,6 +157,10 @@ async def add_language_to_core(
     db.add(config)
     await db.commit()
     await db.refresh(config)
+
+    from app.tasks.translation import translate_new_language_for_core
+    translate_new_language_for_core.delay(core_id, language_code)
+
     return config
 
 
@@ -278,6 +283,15 @@ async def create_item(
 
     await db.commit()
     await db.refresh(item)
+
+    lang_configs = (await db.execute(
+        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
+    )).scalars().all()
+    if lang_configs:
+        from app.tasks.translation import translate_item
+        target_langs = [c.language_code for c in lang_configs]
+        translate_item.delay(item.id, item.english_value, target_langs)
+
     result = await db.execute(
         select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.id == item.id)
     )
@@ -300,6 +314,15 @@ async def update_item(
     await dual_write_update_english(item_id, request.english_value)
     await db.commit()
     await db.refresh(item)
+
+    lang_configs = (await db.execute(
+        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
+    )).scalars().all()
+    if lang_configs:
+        from app.tasks.translation import translate_item
+        target_langs = [c.language_code for c in lang_configs]
+        translate_item.delay(item.id, item.english_value, target_langs)
+
     return item
 
 
@@ -387,6 +410,15 @@ async def upload_csv(
             continue
 
     await db.commit()
+
+    lang_configs = (await db.execute(
+        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
+    )).scalars().all()
+    if lang_configs and created > 0:
+        from app.tasks.translation import retranslate_core as retranslate_task
+        target_langs = [c.language_code for c in lang_configs]
+        retranslate_task.delay(core_id, target_langs, overwrite_expert=False)
+
     return BulkUploadReport(total_rows=len(rows), created=created, skipped_duplicates=skipped, errors=errors)
 
 
@@ -403,3 +435,186 @@ async def list_translations(
     if item.core_id != core_id:
         raise HTTPException(status_code=404, detail="Item not found in this Core")
     return item.translations
+
+
+# ── Re-translation ─────────────────────────────────────────────────────────────
+
+@router.put("/{core_id}/retranslate")
+async def retranslate_core(
+    core_id: str,
+    mode: str = Query("machine_generated_only", description="machine_generated_only or all"),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_designer),
+):
+    """
+    Trigger re-translation for all items in a Core.
+    mode=machine_generated_only: safe — preserves EXPERT_VALIDATED translations.
+    mode=all: overwrites everything including EXPERT_VALIDATED. Use with caution.
+    """
+    await get_core(db, core_id)
+
+    if mode not in ("machine_generated_only", "all"):
+        raise HTTPException(status_code=422, detail="mode must be 'machine_generated_only' or 'all'")
+
+    lang_configs = (await db.execute(
+        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
+    )).scalars().all()
+
+    if not lang_configs:
+        raise HTTPException(status_code=422, detail="No languages configured for this Core")
+
+    target_langs = [c.language_code for c in lang_configs]
+    overwrite_expert = (mode == "all")
+
+    from app.tasks.translation import retranslate_core as retranslate_task
+    retranslate_task.delay(core_id, target_langs, overwrite_expert)
+
+    return {
+        "message": f"Re-translation queued for {len(target_langs)} languages",
+        "mode": mode,
+        "languages": target_langs,
+    }
+
+
+# ── CSV Export (BL-C-08 step 1) ────────────────────────────────────────────────
+
+@router.get("/{core_id}/export-translations")
+async def export_translations_csv(
+    core_id: str,
+    lang: str = Query(..., description="BCP-47 language code, e.g. 'kn', 'hi'"),
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_designer_or_stocker),
+):
+    """
+    Export language-specific CSV for expert correction.
+    UTF-8-BOM encoded for Excel compatibility with Indian scripts.
+    """
+    core = await get_core(db, core_id)
+
+    lang_config = (await db.execute(
+        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id, CoreLanguageConfig.language_code == lang)
+    )).scalar_one_or_none()
+    if not lang_config:
+        raise HTTPException(status_code=404, detail=f"Language '{lang}' not configured for this Core")
+
+    items = (await db.execute(
+        select(CoreDataItem)
+        .options(selectinload(CoreDataItem.translations))
+        .where(CoreDataItem.core_id == core_id, CoreDataItem.status == StatusEnum.ACTIVE)
+        .order_by(CoreDataItem.english_value)
+    )).scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["core_data_item_id", "legacy_item_id", "english_value", lang, "validation_status"])
+
+    for item in items:
+        trans = next((t for t in item.translations if t.language_code == lang), None)
+        writer.writerow([
+            item.id,
+            item.legacy_item_id or "",
+            item.english_value,
+            trans.translated_value if trans else "",
+            trans.validation_status.value if trans else "MACHINE_GENERATED",
+        ])
+
+    csv_content = "﻿" + output.getvalue()
+
+    return StreamingResponse(
+        io.BytesIO(csv_content.encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={core.name}_{lang}.csv"},
+    )
+
+
+# ── CSV Import (BL-C-08 steps 3-7) ────────────────────────────────────────────
+
+@router.post("/{core_id}/import-translations")
+async def import_translations_csv(
+    core_id: str,
+    lang: str = Query(..., description="BCP-47 language code"),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """
+    Import expert-corrected CSV. Matches rows by core_data_item_id (UUID).
+    All uploaded rows are marked EXPERT_VALIDATED regardless of changes.
+    """
+    from app.models.models import ValidationStatus
+
+    await get_core(db, core_id)
+
+    lang_config = (await db.execute(
+        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id, CoreLanguageConfig.language_code == lang)
+    )).scalar_one_or_none()
+    if not lang_config:
+        raise HTTPException(status_code=404, detail=f"Language '{lang}' not configured for this Core")
+
+    content = await file.read()
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = content.decode("utf-8")
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+
+    updated = 0
+    skipped = 0
+    errors = []
+
+    for row in rows:
+        item_id = (row.get("core_data_item_id") or "").strip()
+        translated_value = (row.get(lang) or "").strip()
+
+        if not item_id:
+            errors.append("Row missing core_data_item_id — skipped")
+            continue
+
+        item = (await db.execute(
+            select(CoreDataItem).where(CoreDataItem.id == item_id, CoreDataItem.core_id == core_id)
+        )).scalar_one_or_none()
+        if not item:
+            skipped += 1
+            errors.append(f"ID {item_id}: not found in this Core — skipped")
+            continue
+
+        if not translated_value:
+            skipped += 1
+            continue
+
+        existing = (await db.execute(
+            select(CoreDataTranslation).where(
+                CoreDataTranslation.item_id == item_id,
+                CoreDataTranslation.language_code == lang,
+            )
+        )).scalar_one_or_none()
+
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+
+        if existing:
+            existing.translated_value = translated_value
+            existing.validation_status = ValidationStatus.EXPERT_VALIDATED
+            existing.validated_by = current_user.id
+            existing.validated_at = now
+        else:
+            db.add(CoreDataTranslation(
+                item_id=item_id,
+                language_code=lang,
+                translated_value=translated_value,
+                validation_status=ValidationStatus.EXPERT_VALIDATED,
+                validated_by=current_user.id,
+                validated_at=now,
+            ))
+        updated += 1
+
+    await db.commit()
+
+    return {
+        "total_rows": len(rows),
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+    }
