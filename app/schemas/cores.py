@@ -1,0 +1,102 @@
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime
+from app.models.models import CoreType, ContentType, LanguageMode, StatusEnum
+
+
+class CoreCreate(BaseModel):
+    folder_id: str
+    name: str
+    core_type: CoreType
+    content_type: Optional[ContentType] = None
+    description: Optional[str] = None
+    language_mode: Optional[LanguageMode] = None
+
+
+class CoreUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    language_mode: Optional[LanguageMode] = None
+    assigned_stocker_id: Optional[str] = None
+
+
+class CoreStatusUpdate(BaseModel):
+    status: StatusEnum
+
+
+class CoreOut(BaseModel):
+    id: str
+    folder_id: str
+    name: str
+    core_type: CoreType
+    content_type: Optional[ContentType]
+    description: Optional[str]
+    language_mode: Optional[LanguageMode]
+    status: StatusEnum
+    legacy_core_id: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CoreLanguageConfigOut(BaseModel):
+    id: str
+    core_id: str
+    language_code: str
+
+    class Config:
+        from_attributes = True
+
+
+class CoreProductTagOut(BaseModel):
+    id: str
+    core_id: str
+    product_id: str
+
+    class Config:
+        from_attributes = True
+
+
+class CoreDataItemCreate(BaseModel):
+    english_value: str
+
+
+class CoreDataItemUpdate(BaseModel):
+    english_value: str
+
+
+class CoreDataItemStatusUpdate(BaseModel):
+    status: StatusEnum
+
+
+class TranslationOut(BaseModel):
+    id: str
+    item_id: str
+    language_code: str
+    translated_value: str
+    validation_status: str
+    validated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class CoreDataItemOut(BaseModel):
+    id: str
+    core_id: str
+    english_value: str
+    status: StatusEnum
+    legacy_item_id: Optional[str]
+    created_at: datetime
+    translations: List[TranslationOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class BulkUploadReport(BaseModel):
+    total_rows: int
+    created: int
+    skipped_duplicates: int
+    errors: List[str]
