@@ -99,4 +99,5 @@ class BulkUploadReport(BaseModel):
     total_rows: int
     created: int
     skipped_duplicates: int
+    translations_imported: int = 0
     errors: List[str]

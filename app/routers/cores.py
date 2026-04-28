@@ -10,7 +10,7 @@ from app.dependencies import require_role
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
     CoreProductTag, ProductRegistry, LanguageRegistry,
-    UserRole, StatusEnum, CoreType
+    UserRole, StatusEnum, CoreType, ValidationStatus
 )
 from app.schemas.cores import (
     CoreCreate, CoreUpdate, CoreStatusUpdate, CoreOut,
@@ -373,6 +373,13 @@ async def upload_csv(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer),
 ):
+    """
+    P2-06 / P7-02: Bulk CSV upload for TEXT cores.
+    Columns: english_value (required), legacy_id (optional),
+    plus any number of language columns: {lang}_value and {lang}_validation_status.
+    Language columns allow migration of pre-translated content in one shot.
+    Expert-validated translations are never overwritten by auto-translation.
+    """
     core = await get_core(db, core_id)
     if core.core_type.value != "TEXT":
         raise HTTPException(status_code=422, detail="CSV upload is only for TEXT cores")
@@ -385,9 +392,22 @@ async def upload_csv(
 
     reader = csv.DictReader(io.StringIO(text))
     rows = list(reader)
+    if not rows:
+        raise HTTPException(status_code=422, detail="CSV file is empty or has no data rows")
+
+    # Detect language columns: any header matching "{lang}_value"
+    headers = reader.fieldnames or []
+    lang_cols = {}  # lang_code → (value_col, status_col)
+    for h in headers:
+        if h.endswith("_value") and h != "english_value":
+            lang = h[:-6]  # strip "_value"
+            if len(lang) <= 10:  # plausible language code
+                status_col = f"{lang}_validation_status"
+                lang_cols[lang] = (h, status_col if status_col in headers else None)
 
     created = 0
     skipped = 0
+    translations_imported = 0
     errors = []
 
     for i, row in enumerate(rows, start=2):
@@ -405,37 +425,78 @@ async def upload_csv(
 
         if existing:
             skipped += 1
-            continue
+            # Still import translations for existing items if language columns present
+            item = existing
+        else:
+            item = CoreDataItem(
+                core_id=core_id,
+                english_value=english_value,
+                legacy_item_id=row.get("id") or row.get("legacy_id") or None,
+                status=StatusEnum.ACTIVE,
+                created_by=current_user.id,
+            )
+            db.add(item)
+            await db.flush()
 
-        item = CoreDataItem(
-            core_id=core_id,
-            english_value=english_value,
-            legacy_item_id=row.get("id") or row.get("legacy_id") or None,
-            status=StatusEnum.ACTIVE,
-            created_by=current_user.id,
-        )
-        db.add(item)
-        await db.flush()
+            try:
+                await dual_write_create(db, item)
+                created += 1
+            except Exception as e:
+                await db.rollback()
+                errors.append(f"Row {i}: Neo4J write failed — {str(e)}")
+                continue
 
-        try:
-            await dual_write_create(db, item)
-            created += 1
-        except Exception as e:
-            await db.rollback()
-            errors.append(f"Row {i}: Neo4J write failed — {str(e)}")
-            continue
+        # Import language translations from CSV columns (P7-02)
+        for lang, (val_col, status_col) in lang_cols.items():
+            translated_value = (row.get(val_col) or "").strip()
+            if not translated_value:
+                continue
+
+            raw_status = (row.get(status_col) or "").strip().upper() if status_col else ""
+            is_expert = raw_status in ("EXPERT_VALIDATED", "TRUE", "1", "YES", "VALIDATED")
+            validation_status = ValidationStatus.EXPERT_VALIDATED if is_expert else ValidationStatus.MACHINE_GENERATED
+
+            existing_trans = (await db.execute(
+                select(CoreDataTranslation).where(
+                    CoreDataTranslation.item_id == item.id,
+                    CoreDataTranslation.language_code == lang,
+                )
+            )).scalar_one_or_none()
+
+            if existing_trans:
+                # Never overwrite EXPERT_VALIDATED with machine-generated
+                if existing_trans.validation_status == ValidationStatus.EXPERT_VALIDATED and not is_expert:
+                    continue
+                existing_trans.translated_value = translated_value
+                existing_trans.validation_status = validation_status
+            else:
+                db.add(CoreDataTranslation(
+                    item_id=item.id,
+                    language_code=lang,
+                    translated_value=translated_value,
+                    validation_status=validation_status,
+                ))
+            translations_imported += 1
 
     await db.commit()
 
+    # Only trigger auto-translation for languages NOT already populated by the CSV
     lang_configs = (await db.execute(
         select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
     )).scalars().all()
     if lang_configs and created > 0:
-        from app.tasks.translation import retranslate_core as retranslate_task
-        target_langs = [c.language_code for c in lang_configs]
-        retranslate_task.delay(core_id, target_langs, overwrite_expert=False)
+        langs_needing_translation = [c.language_code for c in lang_configs if c.language_code not in lang_cols]
+        if langs_needing_translation:
+            from app.tasks.translation import retranslate_core as retranslate_task
+            retranslate_task.delay(core_id, langs_needing_translation, overwrite_expert=False)
 
-    return BulkUploadReport(total_rows=len(rows), created=created, skipped_duplicates=skipped, errors=errors)
+    return BulkUploadReport(
+        total_rows=len(rows),
+        created=created,
+        skipped_duplicates=skipped,
+        translations_imported=translations_imported,
+        errors=errors,
+    )
 
 
 # ── Translations ───────────────────────────────────────────────────────────────

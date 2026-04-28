@@ -1,0 +1,137 @@
+"""
+Admin utility endpoints — migration status, health checks.
+"""
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, text as sql_text
+from app.database import get_db
+from app.dependencies import require_role
+from app.models.models import (
+    UserRole, Core, CoreDataItem, CoreDataTranslation, Connect, ConnectDataItem,
+    SimilarityPair, SimilarityStatus, CoreType, StatusEnum, LanguageRegistry,
+)
+from app.neo4j_db import driver
+
+router = APIRouter(prefix="/admin", tags=["Admin"])
+require_admin = require_role(UserRole.ADMIN)
+
+
+@router.get("/migration/status")
+async def migration_status(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    P7-04: Live migration status dashboard.
+    Returns counts from PostgreSQL and Neo4J for quick verification.
+    """
+    # Core counts
+    core_rows = (await db.execute(
+        select(Core.name, Core.core_type, func.count(CoreDataItem.id).label("item_count"))
+        .outerjoin(CoreDataItem, (CoreDataItem.core_id == Core.id) & (CoreDataItem.status == StatusEnum.ACTIVE))
+        .where(Core.status == StatusEnum.ACTIVE)
+        .group_by(Core.id, Core.name, Core.core_type)
+        .order_by(Core.name)
+    )).all()
+
+    total_core_items = sum(r.item_count for r in core_rows)
+
+    # Connect counts
+    connect_rows = (await db.execute(
+        select(Connect.name, func.count(ConnectDataItem.id).label("item_count"))
+        .outerjoin(ConnectDataItem, (ConnectDataItem.connect_id == Connect.id) & (ConnectDataItem.status == StatusEnum.ACTIVE))
+        .where(Connect.status == StatusEnum.ACTIVE)
+        .group_by(Connect.id, Connect.name)
+        .order_by(Connect.name)
+    )).all()
+
+    total_connect_items = sum(r.item_count for r in connect_rows)
+
+    # Translation coverage
+    languages = (await db.execute(
+        select(LanguageRegistry.language_code, LanguageRegistry.language_name_en)
+        .where(LanguageRegistry.status == StatusEnum.ACTIVE, LanguageRegistry.language_code != "en")
+        .order_by(LanguageRegistry.language_code)
+    )).all()
+
+    text_item_count = (await db.execute(
+        select(func.count(CoreDataItem.id))
+        .join(Core, Core.id == CoreDataItem.core_id)
+        .where(CoreDataItem.status == StatusEnum.ACTIVE, Core.core_type == CoreType.TEXT)
+    )).scalar_one()
+
+    translation_coverage = []
+    for lang in languages:
+        translated = (await db.execute(
+            select(func.count(CoreDataTranslation.id))
+            .where(CoreDataTranslation.language_code == lang.language_code)
+        )).scalar_one()
+        expert = (await db.execute(
+            select(func.count(CoreDataTranslation.id))
+            .where(
+                CoreDataTranslation.language_code == lang.language_code,
+                CoreDataTranslation.validation_status == "EXPERT_VALIDATED",
+            )
+        )).scalar_one()
+        pct = round(translated / text_item_count * 100, 1) if text_item_count else 0
+        translation_coverage.append({
+            "language_code": lang.language_code,
+            "language_name": lang.language_name_en,
+            "translated": translated,
+            "expert_validated": expert,
+            "coverage_pct": pct,
+        })
+
+    # Similarity pairs
+    sim_rows = (await db.execute(
+        select(SimilarityPair.status, func.count(SimilarityPair.id).label("cnt"))
+        .group_by(SimilarityPair.status)
+    )).all()
+    similarity_summary = {r.status.value: r.cnt for r in sim_rows}
+
+    # Neo4J counts
+    neo4j_status = {}
+    try:
+        with driver.session() as neo_session:
+            node_count = neo_session.run(
+                "MATCH (n:CoreDataItem) RETURN count(n) AS cnt"
+            ).single()["cnt"]
+            active_node_count = neo_session.run(
+                "MATCH (n:CoreDataItem {status: 'ACTIVE'}) RETURN count(n) AS cnt"
+            ).single()["cnt"]
+            rel_count = neo_session.run(
+                "MATCH ()-[r]->() RETURN count(r) AS cnt"
+            ).single()["cnt"]
+            neo4j_status = {
+                "total_nodes": node_count,
+                "active_nodes": active_node_count,
+                "total_relationships": rel_count,
+                "pg_neo4j_match": active_node_count == total_core_items,
+            }
+    except Exception as e:
+        neo4j_status = {"error": str(e)}
+
+    return {
+        "postgresql": {
+            "cores": [
+                {"name": r.name, "type": r.core_type.value, "active_items": r.item_count}
+                for r in core_rows
+            ],
+            "total_core_data_items": total_core_items,
+            "connects": [
+                {"name": r.name, "active_items": r.item_count}
+                for r in connect_rows
+            ],
+            "total_connect_data_items": total_connect_items,
+        },
+        "translations": {
+            "text_core_items": text_item_count,
+            "coverage_by_language": translation_coverage,
+        },
+        "neo4j": neo4j_status,
+        "similarity": similarity_summary,
+        "migration_ready": (
+            total_core_items > 0
+            and neo4j_status.get("pg_neo4j_match", False)
+        ),
+    }
