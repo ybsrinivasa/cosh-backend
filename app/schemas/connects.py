@@ -87,4 +87,5 @@ class ExcelUploadReport(BaseModel):
     total_rows: int
     resolved: int
     unresolved: int
+    skipped_duplicates: int = 0
     unresolved_details: List[dict]

@@ -279,6 +279,24 @@ async def create_connect_data_item(
             raise HTTPException(status_code=422, detail="The same data item cannot appear twice in one Connect Data row")
         item_ids_used.append(pos.core_data_item_id)
 
+    # Cross-row duplicate check: reject if this exact combination already exists
+    new_fingerprint = "|".join(
+        f"{p.position_number}:{p.core_data_item_id}"
+        for p in sorted(positions, key=lambda x: x.position_number)
+    )
+    existing_items = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
+    )).scalars().all()
+    for existing in existing_items:
+        existing_fp = "|".join(
+            f"{p.position_number}:{p.core_data_item_id}"
+            for p in sorted(existing.positions, key=lambda x: x.position_number)
+        )
+        if existing_fp == new_fingerprint:
+            raise HTTPException(status_code=409, detail="This combination already exists in this Connect")
+
     cdi = ConnectDataItem(
         connect_id=connect_id,
         status=StatusEnum.ACTIVE,
@@ -392,7 +410,22 @@ async def upload_excel(
 
     resolved_count = 0
     unresolved_count = 0
+    skipped_duplicates = 0
     unresolved_details = []
+
+    # Pre-load existing fingerprints for duplicate detection
+    existing_items = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
+    )).scalars().all()
+    existing_fingerprints = {
+        "|".join(
+            f"{p.position_number}:{p.core_data_item_id}"
+            for p in sorted(item.positions, key=lambda x: x.position_number)
+        )
+        for item in existing_items
+    }
 
     for row_num, row in enumerate(data_rows, start=2):
         row_values = [str(v).strip() if v is not None else "" for v in row]
@@ -438,6 +471,16 @@ async def upload_excel(
             unresolved_details.append({"row": row_num, "errors": row_errors})
             continue
 
+        # Skip exact duplicates silently
+        row_fingerprint = "|".join(
+            f"{pos_num}:{item_id}"
+            for pos_num, item_id in sorted(resolved_positions, key=lambda x: x[0])
+        )
+        if row_fingerprint in existing_fingerprints:
+            skipped_duplicates += 1
+            continue
+        existing_fingerprints.add(row_fingerprint)
+
         cdi = ConnectDataItem(
             connect_id=connect_id,
             status=StatusEnum.ACTIVE,
@@ -473,5 +516,6 @@ async def upload_excel(
         total_rows=len(data_rows),
         resolved=resolved_count,
         unresolved=unresolved_count,
+        skipped_duplicates=skipped_duplicates,
         unresolved_details=unresolved_details,
     )
