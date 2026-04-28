@@ -38,6 +38,8 @@ class ConnectOut(BaseModel):
     description: Optional[str]
     status: StatusEnum
     schema_finalised: bool
+    is_public: bool = False
+    assigned_stocker_id: Optional[str] = None
     created_at: datetime
 
     class Config:

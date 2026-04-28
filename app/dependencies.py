@@ -41,6 +41,19 @@ def require_role(*roles: UserRole):
     return role_checker
 
 
+def check_stocker_exclusive_write(entity_assigned_stocker_id, current_user) -> None:
+    """
+    Enforce data-entry ownership: if an entity is assigned to a Stocker,
+    ONLY that Stocker may add or edit its data. Designers and Admins are
+    view-only for assigned entities. Unassigned entities are editable by Designers.
+    """
+    if entity_assigned_stocker_id and current_user.id != entity_assigned_stocker_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This entity is assigned to a Stocker for data entry. Only the assigned Stocker can add or edit data.",
+        )
+
+
 def is_stocker_only(user: User) -> bool:
     """True if the user has STOCKER role but not DESIGNER or ADMIN.
     Used to enforce assignment-based access: Stockers only see/edit

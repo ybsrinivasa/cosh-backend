@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.database import get_db
-from app.dependencies import require_role, is_stocker_only
+from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
     CoreProductTag, ProductRegistry, LanguageRegistry,
@@ -284,6 +284,7 @@ async def create_item(
     current_user=Depends(require_designer_or_stocker),
 ):
     core = await get_core(db, core_id, current_user)
+    check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
 
     existing = (await db.execute(
         select(CoreDataItem).where(
@@ -343,7 +344,8 @@ async def update_item(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer_or_stocker),
 ):
-    await get_core(db, core_id, current_user)
+    core = await get_core(db, core_id, current_user)
+    check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
     item = await get_item(db, item_id)
     if item.core_id != core_id:
         raise HTTPException(status_code=404, detail="Item not found in this Core")
@@ -409,6 +411,7 @@ async def upload_csv(
     Expert-validated translations are never overwritten by auto-translation.
     """
     core = await get_core(db, core_id, current_user)
+    check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
     if core.core_type.value != "TEXT":
         raise HTTPException(status_code=422, detail="CSV upload is only for TEXT cores")
 

@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
-from app.dependencies import require_role, is_stocker_only
+from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Connect, ConnectSchemaPosition, ConnectDataItem, ConnectDataPosition,
     ConnectProductTag, ProductRegistry, CoreDataItem, Core,
@@ -239,6 +239,7 @@ async def create_connect_data_item(
     current_user=Depends(require_designer_or_stocker),
 ):
     connect = await get_connect(db, connect_id, current_user)
+    check_stocker_exclusive_write(connect.assigned_stocker_id, current_user)
 
     schema_result = await db.execute(
         select(ConnectSchemaPosition)
@@ -381,6 +382,7 @@ async def upload_excel(
         raise HTTPException(status_code=500, detail="openpyxl is required for Excel upload. Run: pip install openpyxl")
 
     connect = await get_connect(db, connect_id, current_user)
+    check_stocker_exclusive_write(connect.assigned_stocker_id, current_user)
 
     schema_result = await db.execute(
         select(ConnectSchemaPosition)

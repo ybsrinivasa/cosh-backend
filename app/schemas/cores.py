@@ -33,7 +33,9 @@ class CoreOut(BaseModel):
     description: Optional[str]
     language_mode: Optional[LanguageMode]
     status: StatusEnum
+    is_public: bool = False
     legacy_core_id: Optional[str]
+    assigned_stocker_id: Optional[str] = None
     created_at: datetime
 
     class Config:
