@@ -10,10 +10,11 @@ from app.services.folder_service import name_is_unique, get_folder, folder_is_em
 router = APIRouter(prefix="/folders", tags=["Folders"])
 
 require_designer = require_role(UserRole.DESIGNER, UserRole.ADMIN)
+require_any = require_role(UserRole.DESIGNER, UserRole.STOCKER, UserRole.REVIEWER, UserRole.ADMIN)
 
 
 @router.get("", response_model=list[FolderOut])
-async def list_folders(db: AsyncSession = Depends(get_db), _=Depends(require_designer)):
+async def list_folders(db: AsyncSession = Depends(get_db), _=Depends(require_any)):
     result = await db.execute(select(Folder).order_by(Folder.name))
     return result.scalars().all()
 
