@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: cosh_dev
+      POSTGRES_USER: cosh
+      POSTGRES_PASSWORD: cosh_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
