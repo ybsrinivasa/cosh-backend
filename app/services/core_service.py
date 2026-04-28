@@ -7,6 +7,7 @@ from app.models.models import (
     ConnectDataItem, ConnectDataPosition, StatusEnum
 )
 from app.neo4j_db import driver
+from app.dependencies import is_stocker_only
 
 
 async def name_is_unique_for_core(db: AsyncSession, name: str, exclude_core_id: str = None) -> bool:
@@ -22,11 +23,14 @@ async def name_is_unique_for_core(db: AsyncSession, name: str, exclude_core_id: 
     return core_exists is None
 
 
-async def get_core(db: AsyncSession, core_id: str) -> Core:
+async def get_core(db: AsyncSession, core_id: str, current_user=None) -> Core:
     result = await db.execute(select(Core).where(Core.id == core_id))
     core = result.scalar_one_or_none()
     if not core:
         raise HTTPException(status_code=404, detail="Core not found")
+    if current_user and is_stocker_only(current_user):
+        if core.assigned_stocker_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You are not assigned to this Core")
     return core
 
 

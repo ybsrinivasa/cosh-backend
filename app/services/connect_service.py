@@ -10,13 +10,17 @@ from app.models.models import (
     CoreDataItem, RelationshipTypeRegistry, StatusEnum
 )
 from app.neo4j_db import driver
+from app.dependencies import is_stocker_only
 
 
-async def get_connect(db: AsyncSession, connect_id: str) -> Connect:
+async def get_connect(db: AsyncSession, connect_id: str, current_user=None) -> Connect:
     result = await db.execute(select(Connect).where(Connect.id == connect_id))
     connect = result.scalar_one_or_none()
     if not connect:
         raise HTTPException(status_code=404, detail="Connect not found")
+    if current_user and is_stocker_only(current_user):
+        if connect.assigned_stocker_id != current_user.id:
+            raise HTTPException(status_code=403, detail="You are not assigned to this Connect")
     return connect
 
 

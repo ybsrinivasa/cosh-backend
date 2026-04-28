@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.database import get_db
-from app.dependencies import require_role
+from app.dependencies import require_role, is_stocker_only
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
     CoreProductTag, ProductRegistry, LanguageRegistry,
@@ -34,8 +34,11 @@ require_designer_or_stocker = require_role(UserRole.DESIGNER, UserRole.STOCKER, 
 # ── Core CRUD ──────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=list[CoreOut])
-async def list_cores(db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    result = await db.execute(select(Core).order_by(Core.name))
+async def list_cores(db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    q = select(Core).order_by(Core.name)
+    if is_stocker_only(current_user):
+        q = q.where(Core.assigned_stocker_id == current_user.id)
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -72,8 +75,8 @@ async def create_core(
 
 
 @router.get("/{core_id}", response_model=CoreOut)
-async def get_core_detail(core_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    return await get_core(db, core_id)
+async def get_core_detail(core_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    return await get_core(db, core_id, current_user)
 
 
 @router.put("/{core_id}", response_model=CoreOut)
@@ -128,8 +131,8 @@ async def update_core_status(
 # ── Core Language Config ───────────────────────────────────────────────────────
 
 @router.get("/{core_id}/languages", response_model=list[CoreLanguageConfigOut])
-async def list_core_languages(core_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    await get_core(db, core_id)
+async def list_core_languages(core_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    await get_core(db, core_id, current_user)
     result = await db.execute(select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id))
     return result.scalars().all()
 
@@ -185,8 +188,8 @@ async def remove_language_from_core(
 # ── Core Product Tags ──────────────────────────────────────────────────────────
 
 @router.get("/{core_id}/product-tags", response_model=list[CoreProductTagOut])
-async def list_core_product_tags(core_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    await get_core(db, core_id)
+async def list_core_product_tags(core_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    await get_core(db, core_id, current_user)
     result = await db.execute(select(CoreProductTag).where(CoreProductTag.core_id == core_id))
     return result.scalars().all()
 
@@ -240,9 +243,9 @@ async def list_items(
     core_id: str,
     status_filter: str = "ACTIVE",
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_designer_or_stocker),
+    current_user=Depends(require_designer_or_stocker),
 ):
-    await get_core(db, core_id)
+    await get_core(db, core_id, current_user)
     q = select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.core_id == core_id)
     if status_filter in ("ACTIVE", "INACTIVE"):
         q = q.where(CoreDataItem.status == StatusEnum(status_filter))
@@ -257,7 +260,7 @@ async def create_item(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer_or_stocker),
 ):
-    core = await get_core(db, core_id)
+    core = await get_core(db, core_id, current_user)
 
     existing = (await db.execute(
         select(CoreDataItem).where(
@@ -315,8 +318,9 @@ async def update_item(
     item_id: str,
     request: CoreDataItemUpdate,
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_designer_or_stocker),
+    current_user=Depends(require_designer_or_stocker),
 ):
+    await get_core(db, core_id, current_user)
     item = await get_item(db, item_id)
     if item.core_id != core_id:
         raise HTTPException(status_code=404, detail="Item not found in this Core")
@@ -344,8 +348,9 @@ async def update_item_status(
     item_id: str,
     request: CoreDataItemStatusUpdate,
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_designer_or_stocker),
+    current_user=Depends(require_designer_or_stocker),
 ):
+    await get_core(db, core_id, current_user)
     item = await get_item(db, item_id)
     if item.core_id != core_id:
         raise HTTPException(status_code=404, detail="Item not found in this Core")
@@ -380,7 +385,7 @@ async def upload_csv(
     Language columns allow migration of pre-translated content in one shot.
     Expert-validated translations are never overwritten by auto-translation.
     """
-    core = await get_core(db, core_id)
+    core = await get_core(db, core_id, current_user)
     if core.core_type.value != "TEXT":
         raise HTTPException(status_code=422, detail="CSV upload is only for TEXT cores")
 
@@ -560,13 +565,13 @@ async def export_translations_csv(
     core_id: str,
     lang: str = Query(..., description="BCP-47 language code, e.g. 'kn', 'hi'"),
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_designer_or_stocker),
+    current_user=Depends(require_designer_or_stocker),
 ):
     """
     Export language-specific CSV for expert correction.
     UTF-8-BOM encoded for Excel compatibility with Indian scripts.
     """
-    core = await get_core(db, core_id)
+    core = await get_core(db, core_id, current_user)
 
     lang_config = (await db.execute(
         select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id, CoreLanguageConfig.language_code == lang)
@@ -620,7 +625,7 @@ async def import_translations_csv(
     """
     from app.models.models import ValidationStatus
 
-    await get_core(db, core_id)
+    await get_core(db, core_id, current_user)
 
     lang_config = (await db.execute(
         select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id, CoreLanguageConfig.language_code == lang)

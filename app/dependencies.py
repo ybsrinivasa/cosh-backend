@@ -39,3 +39,15 @@ def require_role(*roles: UserRole):
             )
         return current_user
     return role_checker
+
+
+def is_stocker_only(user: User) -> bool:
+    """True if the user has STOCKER role but not DESIGNER or ADMIN.
+    Used to enforce assignment-based access: Stockers only see/edit
+    Cores and Connects explicitly assigned to them."""
+    active_roles = {r.role for r in user.roles if r.status == StatusEnum.ACTIVE}
+    return (
+        UserRole.STOCKER in active_roles
+        and UserRole.DESIGNER not in active_roles
+        and UserRole.ADMIN not in active_roles
+    )

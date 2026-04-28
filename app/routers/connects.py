@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
-from app.dependencies import require_role
+from app.dependencies import require_role, is_stocker_only
 from app.models.models import (
     Connect, ConnectSchemaPosition, ConnectDataItem, ConnectDataPosition,
     ConnectProductTag, ProductRegistry, CoreDataItem, Core,
@@ -31,8 +31,11 @@ require_designer_or_stocker = require_role(UserRole.DESIGNER, UserRole.STOCKER, 
 # ── Connect CRUD ───────────────────────────────────────────────────────────────
 
 @router.get("", response_model=list[ConnectOut])
-async def list_connects(db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    result = await db.execute(select(Connect).order_by(Connect.name))
+async def list_connects(db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    q = select(Connect).order_by(Connect.name)
+    if is_stocker_only(current_user):
+        q = q.where(Connect.assigned_stocker_id == current_user.id)
+    result = await db.execute(q)
     return result.scalars().all()
 
 
@@ -60,8 +63,8 @@ async def create_connect(
 
 
 @router.get("/{connect_id}", response_model=ConnectOut)
-async def get_connect_detail(connect_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    return await get_connect(db, connect_id)
+async def get_connect_detail(connect_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    return await get_connect(db, connect_id, current_user)
 
 
 @router.put("/{connect_id}", response_model=ConnectOut)
@@ -92,8 +95,8 @@ async def update_connect(
 # ── Connect Schema ─────────────────────────────────────────────────────────────
 
 @router.get("/{connect_id}/schema", response_model=list[SchemaPositionOut])
-async def get_schema(connect_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    await get_connect(db, connect_id)
+async def get_schema(connect_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    await get_connect(db, connect_id, current_user)
     result = await db.execute(
         select(ConnectSchemaPosition)
         .where(ConnectSchemaPosition.connect_id == connect_id)
@@ -163,8 +166,8 @@ async def define_schema(
 # ── Connect Product Tags ───────────────────────────────────────────────────────
 
 @router.get("/{connect_id}/product-tags", response_model=list[ConnectProductTagOut])
-async def list_connect_product_tags(connect_id: str, db: AsyncSession = Depends(get_db), _=Depends(require_designer_or_stocker)):
-    await get_connect(db, connect_id)
+async def list_connect_product_tags(connect_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
+    await get_connect(db, connect_id, current_user)
     result = await db.execute(select(ConnectProductTag).where(ConnectProductTag.connect_id == connect_id))
     return result.scalars().all()
 
@@ -216,9 +219,9 @@ async def remove_connect_product_tag(
 async def list_connect_data_items(
     connect_id: str,
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_designer_or_stocker),
+    current_user=Depends(require_designer_or_stocker),
 ):
-    await get_connect(db, connect_id)
+    await get_connect(db, connect_id, current_user)
     result = await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
@@ -235,7 +238,7 @@ async def create_connect_data_item(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer_or_stocker),
 ):
-    connect = await get_connect(db, connect_id)
+    connect = await get_connect(db, connect_id, current_user)
 
     schema_result = await db.execute(
         select(ConnectSchemaPosition)
@@ -320,8 +323,9 @@ async def update_connect_data_status(
     cdi_id: str,
     request: ConnectDataStatusUpdate,
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_designer_or_stocker),
+    current_user=Depends(require_designer_or_stocker),
 ):
+    await get_connect(db, connect_id, current_user)
     result = await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
@@ -358,7 +362,7 @@ async def upload_excel(
     except ImportError:
         raise HTTPException(status_code=500, detail="openpyxl is required for Excel upload. Run: pip install openpyxl")
 
-    connect = await get_connect(db, connect_id)
+    connect = await get_connect(db, connect_id, current_user)
 
     schema_result = await db.execute(
         select(ConnectSchemaPosition)
