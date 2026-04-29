@@ -13,7 +13,7 @@ from app.models.models import (
 from app.schemas.connects import (
     ConnectCreate, ConnectUpdate, ConnectOut, SchemaPositionIn, SchemaPositionOut,
     ConnectDataPositionIn, ConnectDataItemOut, ConnectProductTagOut,
-    ConnectDataStatusUpdate, ExcelUploadReport
+    ConnectStatusUpdate, ConnectDataStatusUpdate, ExcelUploadReport
 )
 from app.services.connect_service import (
     get_connect, check_schema_uniqueness, validate_relationship_type,
@@ -86,6 +86,33 @@ async def update_connect(
         connect.description = request.description
     if request.assigned_stocker_id is not None:
         connect.assigned_stocker_id = request.assigned_stocker_id
+
+    await db.commit()
+    await db.refresh(connect)
+    return connect
+
+
+@router.put("/{connect_id}/status", response_model=ConnectOut)
+async def update_connect_status(
+    connect_id: str,
+    request: ConnectStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_designer),
+):
+    """Inactivate or reactivate a Connect. Inactivating also inactivates all its data rows."""
+    connect = await get_connect(db, connect_id)
+    connect.status = request.status
+
+    if request.status == StatusEnum.INACTIVE:
+        active_items = (await db.execute(
+            select(ConnectDataItem).where(
+                ConnectDataItem.connect_id == connect_id,
+                ConnectDataItem.status == StatusEnum.ACTIVE,
+            )
+        )).scalars().all()
+        for item in active_items:
+            item.status = StatusEnum.INACTIVE
+            inactivate_neo4j_relationships(item.id)
 
     await db.commit()
     await db.refresh(connect)
@@ -301,7 +328,7 @@ async def create_connect_data_item(
             raise HTTPException(status_code=422, detail="The same data item cannot appear twice in one Connect Data row")
         item_ids_used.append(pos.core_data_item_id)
 
-    # Cross-row duplicate check: reject if this exact combination already exists
+    # Cross-row duplicate check: reject if this exact combination already exists (active OR inactive)
     new_fingerprint = "|".join(
         f"{p.position_number}:{p.core_data_item_id}"
         for p in sorted(positions, key=lambda x: x.position_number)
@@ -309,7 +336,7 @@ async def create_connect_data_item(
     existing_items = (await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
-        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
+        .where(ConnectDataItem.connect_id == connect_id)  # all statuses
     )).scalars().all()
     for existing in existing_items:
         existing_fp = "|".join(
@@ -317,7 +344,12 @@ async def create_connect_data_item(
             for p in sorted(existing.positions, key=lambda x: x.position_number)
         )
         if existing_fp == new_fingerprint:
-            raise HTTPException(status_code=409, detail="This combination already exists in this Connect")
+            msg = (
+                "This combination already exists in this Connect (currently inactive — reactivate it instead)"
+                if existing.status == StatusEnum.INACTIVE
+                else "This combination already exists in this Connect"
+            )
+            raise HTTPException(status_code=409, detail=msg)
 
     cdi = ConnectDataItem(
         connect_id=connect_id,
@@ -404,7 +436,7 @@ async def update_connect_data_item(
         if not item:
             raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: item not found or inactive in the expected Core")
 
-    # Duplicate check — exclude this row itself
+    # Duplicate check — exclude this row itself, include all statuses
     new_fingerprint = "|".join(
         f"{p.position_number}:{p.core_data_item_id}"
         for p in sorted(positions, key=lambda x: x.position_number)
@@ -414,7 +446,6 @@ async def update_connect_data_item(
         .options(selectinload(ConnectDataItem.positions))
         .where(
             ConnectDataItem.connect_id == connect_id,
-            ConnectDataItem.status == StatusEnum.ACTIVE,
             ConnectDataItem.id != cdi_id,
         )
     )).scalars().all()
@@ -424,7 +455,12 @@ async def update_connect_data_item(
             for p in sorted(other.positions, key=lambda x: x.position_number)
         )
         if other_fp == new_fingerprint:
-            raise HTTPException(status_code=409, detail="This combination already exists in this Connect")
+            msg = (
+                "This combination already exists (currently inactive — reactivate it instead)"
+                if other.status == StatusEnum.INACTIVE
+                else "This combination already exists in this Connect"
+            )
+            raise HTTPException(status_code=409, detail=msg)
 
     # Replace positions
     for old_pos in cdi.positions:

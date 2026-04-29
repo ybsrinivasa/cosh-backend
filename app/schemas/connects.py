@@ -82,6 +82,10 @@ class ConnectProductTagOut(BaseModel):
         from_attributes = True
 
 
+class ConnectStatusUpdate(BaseModel):
+    status: StatusEnum
+
+
 class ConnectDataStatusUpdate(BaseModel):
     status: StatusEnum
 
