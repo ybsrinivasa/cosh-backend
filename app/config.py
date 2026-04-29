@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     admin_email: str
     admin_password: str
     environment: str = "development"
+    cors_origins: str = "http://localhost:3000"
 
     # AWS S3
     aws_access_key_id: str = "placeholder"

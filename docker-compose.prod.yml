@@ -1,0 +1,124 @@
+# Stage 1 — Shared Dev Server (t3.large, 8 GB RAM)
+# All services on one EC2 instance.
+# EBS volumes must be created and mounted before starting:
+#   /data/postgres  (20 GB gp3)
+#   /data/neo4j     (50 GB gp3)
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data
+    # Not exposed publicly — API connects via Docker network
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Neo4J ───────────────────────────────────────────────────────────────────
+  # Memory config for t3.large (8 GB total):
+  #   4 GB heap + 1 GB pagecache = 5 GB Neo4J, leaving 3 GB for OS + app
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_heap_initial__size: '2g'
+      NEO4J_dbms_memory_heap_max__size: '4g'
+      NEO4J_dbms_memory_pagecache__size: '1g'
+      NEO4J_server_bolt_advertised__address: ':7687'
+    volumes:
+      - /data/neo4j/data:/data
+      - /data/neo4j/logs:/logs
+      - /data/neo4j/plugins:/plugins
+    expose:
+      - "7687"   # Bolt — used by app
+    ports:
+      - "127.0.0.1:7474:7474"  # Browser — localhost only (SSH tunnel to access)
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ── FastAPI ─────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Celery Workers ──────────────────────────────────────────────────────────
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app worker --loglevel=info -Q translation,similarity,sync --concurrency=2
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Next.js Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: /home/ubuntu/cosh-frontend
+      dockerfile: Dockerfile
+      args:
+        # API is served at /api by nginx — same domain, no CORS
+        NEXT_PUBLIC_API_URL: https://cosh.dev.eywa.farm/api
+    restart: unless-stopped
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  default:
+    name: cosh_network
