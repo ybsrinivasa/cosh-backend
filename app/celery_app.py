@@ -2,6 +2,11 @@ from celery import Celery
 from celery.schedules import crontab
 from app.config import settings
 
+# To run workers with beat scheduler (single process, dev/stage):
+#   celery -A app.celery_app worker --loglevel=info -Q translation,similarity,sync -B
+# For production, run beat as a separate process:
+#   celery -A app.celery_app beat --loglevel=info
+
 celery_app = Celery(
     "cosh",
     broker=settings.redis_url,

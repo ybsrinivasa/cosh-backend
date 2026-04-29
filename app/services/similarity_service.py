@@ -4,11 +4,11 @@ Async service used by the FastAPI router.
 """
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from fastapi import HTTPException
 from app.models.models import (
     SimilarityPair, SimilarityStatus, CoreDataItem, Core,
-    AuditLog, CoreLanguageConfig, StatusEnum,
+    AuditLog, CoreLanguageConfig, StatusEnum, ConnectDataPosition,
 )
 from app.services.core_service import inactivity_cascade
 from app.neo4j_db import driver
@@ -124,10 +124,20 @@ async def action_merge(db: AsyncSession, pair: SimilarityPair, canonical_value: 
             id=item_a.id, val=canonical,
         )
 
-    # (b) Transfer Neo4J relationships from B → A before cascade inactivates B's rels
+    # (b) Re-point all ConnectDataPosition rows from item B → item A BEFORE cascade.
+    #     This preserves every Connect Data row that referenced B — they now reference A.
+    #     inactivity_cascade(B) then finds nothing to inactivate (correct per doc §10.3).
+    await db.execute(
+        update(ConnectDataPosition)
+        .where(ConnectDataPosition.core_data_item_id == pair.item_id_b)
+        .values(core_data_item_id=pair.item_id_a)
+    )
+    await db.flush()
+
+    # (c) Transfer Neo4J relationships from B → A before item B is inactivated
     _transfer_neo4j_relationships(pair.item_id_b, pair.item_id_a)
 
-    # (c) Inactivate item B and cascade (BL-C-02)
+    # (d) Inactivate item B — cascade finds no positions referencing B, so no Connect Data rows are lost
     item_b.status = StatusEnum.INACTIVE
     await inactivity_cascade(db, pair.item_id_b)
 
