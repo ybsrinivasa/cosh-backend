@@ -1,17 +1,33 @@
 """
 Admin utility endpoints — migration status, public visibility, health checks.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status as http_status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text as sql_text
+from sqlalchemy import select, func, update, text as sql_text
+from typing import Optional
+from pydantic import BaseModel
 from app.database import get_db
 from app.dependencies import require_role
 from app.models.models import (
     UserRole, Core, CoreDataItem, CoreDataTranslation, Connect, ConnectDataItem,
     SimilarityPair, SimilarityStatus, CoreType, StatusEnum, LanguageRegistry,
-    RelationshipTypeRegistry, ProductRegistry, ConnectSchemaPosition,
+    RelationshipTypeRegistry, ProductRegistry, ConnectSchemaPosition, User,
 )
 from app.neo4j_db import driver
+
+
+class RelTypeCreate(BaseModel):
+    label: str
+    display_name: str
+    description: Optional[str] = None
+    example: Optional[str] = None
+
+
+class RelTypeUpdate(BaseModel):
+    label: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    example: Optional[str] = None
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 require_admin = require_role(UserRole.ADMIN)
@@ -213,11 +229,95 @@ async def list_languages(db: AsyncSession = Depends(get_db)):
 @router.get("/registries/relationship-types")
 async def list_relationship_types(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(RelationshipTypeRegistry).order_by(RelationshipTypeRegistry.label))
+    rts = result.scalars().all()
+
+    # Count how many schema positions use each label
+    usage_rows = (await db.execute(
+        select(ConnectSchemaPosition.relationship_type_to_next, func.count(ConnectSchemaPosition.id).label("cnt"))
+        .where(ConnectSchemaPosition.relationship_type_to_next.isnot(None))
+        .group_by(ConnectSchemaPosition.relationship_type_to_next)
+    )).all()
+    usage_map = {r.relationship_type_to_next: r.cnt for r in usage_rows}
+
     return [
         {"id": r.id, "label": r.label, "display_name": r.display_name,
-         "description": r.description, "example": r.example}
-        for r in result.scalars().all()
+         "description": r.description, "example": r.example,
+         "usage_count": usage_map.get(r.label, 0)}
+        for r in rts
     ]
+
+
+@router.post("/registries/relationship-types", status_code=http_status.HTTP_201_CREATED)
+async def create_relationship_type(
+    request: RelTypeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    existing = (await db.execute(
+        select(RelationshipTypeRegistry).where(RelationshipTypeRegistry.label == request.label)
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"A relationship type with label '{request.label}' already exists")
+
+    rt = RelationshipTypeRegistry(
+        label=request.label,
+        display_name=request.display_name,
+        description=request.description,
+        example=request.example,
+        added_by=current_user.id,
+    )
+    db.add(rt)
+    await db.commit()
+    await db.refresh(rt)
+    return {"id": rt.id, "label": rt.label, "display_name": rt.display_name,
+            "description": rt.description, "example": rt.example, "usage_count": 0}
+
+
+@router.put("/registries/relationship-types/{rt_id}")
+async def update_relationship_type(
+    rt_id: str,
+    request: RelTypeUpdate,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    rt = (await db.execute(
+        select(RelationshipTypeRegistry).where(RelationshipTypeRegistry.id == rt_id)
+    )).scalar_one_or_none()
+    if not rt:
+        raise HTTPException(status_code=404, detail="Relationship type not found")
+
+    if request.label is not None and request.label != rt.label:
+        conflict = (await db.execute(
+            select(RelationshipTypeRegistry).where(RelationshipTypeRegistry.label == request.label)
+        )).scalar_one_or_none()
+        if conflict:
+            raise HTTPException(status_code=409, detail=f"Label '{request.label}' is already used by another relationship type")
+
+        # Cascade: update all schema positions that use the old label
+        await db.execute(
+            update(ConnectSchemaPosition)
+            .where(ConnectSchemaPosition.relationship_type_to_next == rt.label)
+            .values(relationship_type_to_next=request.label)
+        )
+        rt.label = request.label
+
+    if request.display_name is not None:
+        rt.display_name = request.display_name
+    if request.description is not None:
+        rt.description = request.description
+    if request.example is not None:
+        rt.example = request.example
+
+    await db.commit()
+    await db.refresh(rt)
+
+    usage_count = (await db.execute(
+        select(func.count(ConnectSchemaPosition.id))
+        .where(ConnectSchemaPosition.relationship_type_to_next == rt.label)
+    )).scalar_one()
+
+    return {"id": rt.id, "label": rt.label, "display_name": rt.display_name,
+            "description": rt.description, "example": rt.example, "usage_count": usage_count}
 
 
 @router.get("/registries/products")
