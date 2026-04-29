@@ -8,7 +8,7 @@ from app.dependencies import require_role, is_stocker_only, check_stocker_exclus
 from app.models.models import (
     Connect, ConnectSchemaPosition, ConnectDataItem, ConnectDataPosition,
     ConnectProductTag, ProductRegistry, CoreDataItem, Core, User,
-    UserRole, StatusEnum
+    UserRole, StatusEnum, NodeType
 )
 from app.schemas.connects import (
     ConnectCreate, ConnectUpdate, ConnectOut, SchemaPositionIn, SchemaPositionOut,
@@ -16,7 +16,7 @@ from app.schemas.connects import (
     ConnectStatusUpdate, ConnectDataStatusUpdate, ExcelUploadReport
 )
 from app.services.connect_service import (
-    get_connect, check_schema_uniqueness, validate_relationship_type,
+    get_connect, check_schema_uniqueness_with_connect_refs, validate_relationship_type,
     create_neo4j_relationships, inactivate_neo4j_relationships
 )
 from app.services.sync_service import write_sync_changes
@@ -121,6 +121,36 @@ async def update_connect_status(
 
 # ── Connect Schema ─────────────────────────────────────────────────────────────
 
+async def _enrich_schema_positions(db: AsyncSession, positions) -> list[SchemaPositionOut]:
+    """Resolve Core/Connect names for schema positions."""
+    core_ids = list({p.core_id for p in positions if p.core_id})
+    core_name_map = {}
+    if core_ids:
+        cores = (await db.execute(select(Core.id, Core.name).where(Core.id.in_(core_ids)))).all()
+        core_name_map = {c.id: c.name for c in cores}
+
+    connect_ref_ids = list({p.connect_ref_id for p in positions if p.connect_ref_id})
+    connect_name_map = {}
+    if connect_ref_ids:
+        connects = (await db.execute(select(Connect.id, Connect.name).where(Connect.id.in_(connect_ref_ids)))).all()
+        connect_name_map = {c.id: c.name for c in connects}
+
+    return [
+        SchemaPositionOut(
+            id=p.id,
+            connect_id=p.connect_id,
+            position_number=p.position_number,
+            node_type=p.node_type.value if hasattr(p.node_type, 'value') else str(p.node_type),
+            core_id=p.core_id,
+            core_name=core_name_map.get(p.core_id) if p.core_id else None,
+            connect_ref_id=p.connect_ref_id,
+            connect_ref_name=connect_name_map.get(p.connect_ref_id) if p.connect_ref_id else None,
+            relationship_type_to_next=p.relationship_type_to_next,
+        )
+        for p in positions
+    ]
+
+
 @router.get("/{connect_id}/schema", response_model=list[SchemaPositionOut])
 async def get_schema(connect_id: str, db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
     await get_connect(db, connect_id, current_user)
@@ -132,25 +162,7 @@ async def get_schema(connect_id: str, db: AsyncSession = Depends(get_db), curren
     positions = result.scalars().all()
     if not positions:
         return []
-
-    # Enrich each position with Core name — avoids frontend needing a separate Core lookup
-    core_ids = list({p.core_id for p in positions})
-    cores = (await db.execute(
-        select(Core.id, Core.name).where(Core.id.in_(core_ids))
-    )).all()
-    core_name_map = {c.id: c.name for c in cores}
-
-    return [
-        SchemaPositionOut(
-            id=p.id,
-            connect_id=p.connect_id,
-            position_number=p.position_number,
-            core_id=p.core_id,
-            core_name=core_name_map.get(p.core_id),
-            relationship_type_to_next=p.relationship_type_to_next,
-        )
-        for p in positions
-    ]
+    return await _enrich_schema_positions(db, positions)
 
 
 @router.post("/{connect_id}/schema", response_model=list[SchemaPositionOut], status_code=status.HTTP_201_CREATED)
@@ -172,6 +184,15 @@ async def define_schema(
 
     for i, pos in enumerate(sorted_positions):
         is_last = (i == len(sorted_positions) - 1)
+
+        # Validate exactly one of core_id / connect_ref_id is set
+        has_core = bool(pos.core_id)
+        has_connect = bool(pos.connect_ref_id)
+        if not has_core and not has_connect:
+            raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: must specify either core_id or connect_ref_id")
+        if has_core and has_connect:
+            raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: specify either core_id or connect_ref_id, not both")
+
         if is_last:
             if pos.relationship_type_to_next:
                 raise HTTPException(status_code=422, detail="The last position must not have a relationship_type_to_next")
@@ -180,27 +201,42 @@ async def define_schema(
                 raise HTTPException(status_code=422, detail=f"Position {pos.position_number} must have a relationship_type_to_next")
             await validate_relationship_type(db, pos.relationship_type_to_next)
 
-        core_exists = (await db.execute(select(Core).where(Core.id == pos.core_id))).scalar_one_or_none()
-        if not core_exists:
-            raise HTTPException(status_code=404, detail=f"Core '{pos.core_id}' not found for position {pos.position_number}")
+        if has_core:
+            core_exists = (await db.execute(select(Core).where(Core.id == pos.core_id))).scalar_one_or_none()
+            if not core_exists:
+                raise HTTPException(status_code=404, detail=f"Core '{pos.core_id}' not found for position {pos.position_number}")
+        else:
+            if pos.connect_ref_id == connect_id:
+                raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: a Connect cannot reference itself")
+            ref_connect = (await db.execute(select(Connect).where(Connect.id == pos.connect_ref_id))).scalar_one_or_none()
+            if not ref_connect:
+                raise HTTPException(status_code=404, detail=f"Connect '{pos.connect_ref_id}' not found for position {pos.position_number}")
 
-    position_dicts = [{"position_number": p.position_number, "core_id": p.core_id, "relationship_type_to_next": p.relationship_type_to_next} for p in sorted_positions]
-    await check_schema_uniqueness(db, position_dicts, exclude_connect_id=connect_id)
+    position_dicts = [
+        {
+            "position_number": p.position_number,
+            "core_id": p.core_id,
+            "connect_ref_id": p.connect_ref_id,
+            "relationship_type_to_next": p.relationship_type_to_next,
+        }
+        for p in sorted_positions
+    ]
+    await check_schema_uniqueness_with_connect_refs(db, position_dicts, exclude_connect_id=connect_id)
 
     existing = await db.execute(select(ConnectSchemaPosition).where(ConnectSchemaPosition.connect_id == connect_id))
     for row in existing.scalars().all():
         await db.delete(row)
 
-    new_positions = []
     for pos in sorted_positions:
         schema_pos = ConnectSchemaPosition(
             connect_id=connect_id,
             position_number=pos.position_number,
+            node_type=NodeType.CONNECT if pos.connect_ref_id else NodeType.CORE,
             core_id=pos.core_id,
+            connect_ref_id=pos.connect_ref_id,
             relationship_type_to_next=pos.relationship_type_to_next,
         )
         db.add(schema_pos)
-        new_positions.append(schema_pos)
 
     await db.commit()
     result = await db.execute(
@@ -208,7 +244,7 @@ async def define_schema(
         .where(ConnectSchemaPosition.connect_id == connect_id)
         .order_by(ConnectSchemaPosition.position_number)
     )
-    return result.scalars().all()
+    return await _enrich_schema_positions(db, result.scalars().all())
 
 
 # ── Connect Product Tags ───────────────────────────────────────────────────────
@@ -261,6 +297,55 @@ async def remove_connect_product_tag(
     await db.commit()
 
 
+# ── Connect Data Rows for Combobox ────────────────────────────────────────────
+
+@router.get("/{connect_id}/data-rows")
+async def get_connect_data_rows(
+    connect_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """Return active data rows as labelled options for use in another Connect's data entry form."""
+    schema_positions = (await db.execute(
+        select(ConnectSchemaPosition)
+        .where(ConnectSchemaPosition.connect_id == connect_id)
+        .order_by(ConnectSchemaPosition.position_number)
+    )).scalars().all()
+
+    items = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
+        .order_by(ConnectDataItem.created_at)
+    )).scalars().all()
+
+    # Batch-resolve all core_data_item_ids to English values
+    all_cdi_ids = {pos.core_data_item_id for item in items for pos in item.positions if pos.core_data_item_id}
+    value_map = {}
+    if all_cdi_ids:
+        rows = (await db.execute(
+            select(CoreDataItem.id, CoreDataItem.english_value).where(CoreDataItem.id.in_(all_cdi_ids))
+        )).all()
+        value_map = {r.id: r.english_value for r in rows}
+
+    result = []
+    for item in items:
+        pos_map = {p.position_number: p for p in item.positions}
+        parts = []
+        for sp in schema_positions:
+            p = pos_map.get(sp.position_number)
+            if p:
+                if p.core_data_item_id:
+                    parts.append(value_map.get(p.core_data_item_id, '?'))
+                elif p.connect_data_item_ref_id:
+                    parts.append(f'[nested:{p.connect_data_item_ref_id[:8]}]')
+            else:
+                parts.append('?')
+        result.append({"id": item.id, "label": " — ".join(parts)})
+
+    return result
+
+
 # ── Connect Data Items — Manual Entry ─────────────────────────────────────────
 
 @router.get("/{connect_id}/items", response_model=list[ConnectDataItemOut])
@@ -277,7 +362,6 @@ async def list_connect_data_items(
         .order_by(ConnectDataItem.created_at)
     )).scalars().all()
 
-    # Resolve creator names in one batch query
     user_ids = list({item.created_by for item in items if item.created_by})
     user_map: dict = {}
     if user_ids:
@@ -297,6 +381,87 @@ async def list_connect_data_items(
         }
         for item in items
     ]
+
+
+def _position_value_id(pos) -> str:
+    """Return the value identifier for a data position regardless of type."""
+    return pos.connect_data_item_ref_id or pos.core_data_item_id or ""
+
+
+def _input_value_id(pos_in) -> str:
+    """Return the value identifier from a ConnectDataPositionIn."""
+    return pos_in.connect_data_item_ref_id or pos_in.core_data_item_id or ""
+
+
+def _make_fingerprint(positions) -> str:
+    return "|".join(
+        f"{p.position_number}:{_position_value_id(p)}"
+        for p in sorted(positions, key=lambda x: x.position_number)
+    )
+
+
+def _make_input_fingerprint(positions_in) -> str:
+    return "|".join(
+        f"{p.position_number}:{_input_value_id(p)}"
+        for p in sorted(positions_in, key=lambda x: x.position_number)
+    )
+
+
+async def _validate_positions(db, positions_in, schema_positions, connect_id):
+    """Validate each submitted position against the schema. Returns list of (position_number, value_id)."""
+    if len(positions_in) != len(schema_positions):
+        raise HTTPException(status_code=422, detail=f"Expected {len(schema_positions)} positions, got {len(positions_in)}")
+
+    schema_map = {p.position_number: p for p in schema_positions}
+    resolved = []
+    seen_ids = []
+
+    for pos in positions_in:
+        if pos.position_number not in schema_map:
+            raise HTTPException(status_code=422, detail=f"Position {pos.position_number} not in schema")
+
+        schema_pos = schema_map[pos.position_number]
+        node_type = schema_pos.node_type.value if hasattr(schema_pos.node_type, 'value') else str(schema_pos.node_type)
+
+        if node_type == 'CORE':
+            if not pos.core_data_item_id:
+                raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: core_data_item_id is required for Core-type position")
+            item = (await db.execute(
+                select(CoreDataItem).where(
+                    CoreDataItem.id == pos.core_data_item_id,
+                    CoreDataItem.core_id == schema_pos.core_id,
+                    CoreDataItem.status == StatusEnum.ACTIVE
+                )
+            )).scalar_one_or_none()
+            if not item:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Position {pos.position_number}: item not found or not active in the expected Core"
+                )
+            value_id = pos.core_data_item_id
+        else:  # CONNECT
+            if not pos.connect_data_item_ref_id:
+                raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: connect_data_item_ref_id is required for Connect-type position")
+            ref_row = (await db.execute(
+                select(ConnectDataItem).where(
+                    ConnectDataItem.id == pos.connect_data_item_ref_id,
+                    ConnectDataItem.connect_id == schema_pos.connect_ref_id,
+                    ConnectDataItem.status == StatusEnum.ACTIVE
+                )
+            )).scalar_one_or_none()
+            if not ref_row:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Position {pos.position_number}: referenced Connect data row not found or not active"
+                )
+            value_id = pos.connect_data_item_ref_id
+
+        if value_id in seen_ids:
+            raise HTTPException(status_code=422, detail="The same data item cannot appear twice in one Connect Data row")
+        seen_ids.append(value_id)
+        resolved.append((pos.position_number, value_id))
+
+    return resolved
 
 
 @router.post("/{connect_id}/items", response_model=ConnectDataItemOut, status_code=status.HTTP_201_CREATED)
@@ -319,51 +484,17 @@ async def create_connect_data_item(
     if not schema_positions:
         raise HTTPException(status_code=422, detail="Define the Connect schema before adding data")
 
-    if len(positions) != len(schema_positions):
-        raise HTTPException(status_code=422, detail=f"Expected {len(schema_positions)} positions, got {len(positions)}")
+    resolved = await _validate_positions(db, positions, schema_positions, connect_id)
 
-    schema_map = {p.position_number: p for p in schema_positions}
-    item_ids_used = []
-
-    for pos in positions:
-        if pos.position_number not in schema_map:
-            raise HTTPException(status_code=422, detail=f"Position {pos.position_number} not in schema")
-
-        schema_pos = schema_map[pos.position_number]
-        item = (await db.execute(
-            select(CoreDataItem).where(
-                CoreDataItem.id == pos.core_data_item_id,
-                CoreDataItem.core_id == schema_pos.core_id,
-                CoreDataItem.status == StatusEnum.ACTIVE
-            )
-        )).scalar_one_or_none()
-
-        if not item:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Position {pos.position_number}: item '{pos.core_data_item_id}' not found or not active in the expected Core"
-            )
-
-        if pos.core_data_item_id in item_ids_used:
-            raise HTTPException(status_code=422, detail="The same data item cannot appear twice in one Connect Data row")
-        item_ids_used.append(pos.core_data_item_id)
-
-    # Cross-row duplicate check: reject if this exact combination already exists (active OR inactive)
-    new_fingerprint = "|".join(
-        f"{p.position_number}:{p.core_data_item_id}"
-        for p in sorted(positions, key=lambda x: x.position_number)
-    )
+    # Cross-row duplicate check (all statuses)
+    new_fingerprint = _make_input_fingerprint(positions)
     existing_items = (await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
-        .where(ConnectDataItem.connect_id == connect_id)  # all statuses
+        .where(ConnectDataItem.connect_id == connect_id)
     )).scalars().all()
     for existing in existing_items:
-        existing_fp = "|".join(
-            f"{p.position_number}:{p.core_data_item_id}"
-            for p in sorted(existing.positions, key=lambda x: x.position_number)
-        )
-        if existing_fp == new_fingerprint:
+        if _make_fingerprint(existing.positions) == new_fingerprint:
             msg = (
                 "This combination already exists in this Connect (currently inactive — reactivate it instead)"
                 if existing.status == StatusEnum.INACTIVE
@@ -371,11 +502,7 @@ async def create_connect_data_item(
             )
             raise HTTPException(status_code=409, detail=msg)
 
-    cdi = ConnectDataItem(
-        connect_id=connect_id,
-        status=StatusEnum.ACTIVE,
-        created_by=current_user.id,
-    )
+    cdi = ConnectDataItem(connect_id=connect_id, status=StatusEnum.ACTIVE, created_by=current_user.id)
     db.add(cdi)
     await db.flush()
 
@@ -384,9 +511,9 @@ async def create_connect_data_item(
             connect_data_item_id=cdi.id,
             position_number=pos.position_number,
             core_data_item_id=pos.core_data_item_id,
+            connect_data_item_ref_id=pos.connect_data_item_ref_id,
         ))
 
-    resolved = [(p.position_number, p.core_data_item_id) for p in positions]
     try:
         create_neo4j_relationships(cdi.id, connect_id, resolved, schema_positions)
     except Exception as e:
@@ -417,7 +544,6 @@ async def update_connect_data_item(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer_or_stocker),
 ):
-    """Edit a Connect Data row by replacing its positions. Neo4J relationships are updated atomically."""
     connect = await get_connect(db, connect_id, current_user)
     check_stocker_exclusive_write(connect.assigned_stocker_id, current_user)
 
@@ -438,43 +564,17 @@ async def update_connect_data_item(
     )
     schema_positions = schema_result.scalars().all()
 
-    if len(positions) != len(schema_positions):
-        raise HTTPException(status_code=422, detail=f"Expected {len(schema_positions)} positions, got {len(positions)}")
+    resolved = await _validate_positions(db, positions, schema_positions, connect_id)
 
-    schema_map = {p.position_number: p for p in schema_positions}
-    for pos in positions:
-        if pos.position_number not in schema_map:
-            raise HTTPException(status_code=422, detail=f"Position {pos.position_number} not in schema")
-        schema_pos = schema_map[pos.position_number]
-        item = (await db.execute(
-            select(CoreDataItem).where(
-                CoreDataItem.id == pos.core_data_item_id,
-                CoreDataItem.core_id == schema_pos.core_id,
-                CoreDataItem.status == StatusEnum.ACTIVE,
-            )
-        )).scalar_one_or_none()
-        if not item:
-            raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: item not found or inactive in the expected Core")
-
-    # Duplicate check — exclude this row itself, include all statuses
-    new_fingerprint = "|".join(
-        f"{p.position_number}:{p.core_data_item_id}"
-        for p in sorted(positions, key=lambda x: x.position_number)
-    )
+    # Duplicate check — exclude this row itself
+    new_fingerprint = _make_input_fingerprint(positions)
     other_items = (await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
-        .where(
-            ConnectDataItem.connect_id == connect_id,
-            ConnectDataItem.id != cdi_id,
-        )
+        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.id != cdi_id)
     )).scalars().all()
     for other in other_items:
-        other_fp = "|".join(
-            f"{p.position_number}:{p.core_data_item_id}"
-            for p in sorted(other.positions, key=lambda x: x.position_number)
-        )
-        if other_fp == new_fingerprint:
+        if _make_fingerprint(other.positions) == new_fingerprint:
             msg = (
                 "This combination already exists (currently inactive — reactivate it instead)"
                 if other.status == StatusEnum.INACTIVE
@@ -482,7 +582,6 @@ async def update_connect_data_item(
             )
             raise HTTPException(status_code=409, detail=msg)
 
-    # Replace positions
     for old_pos in cdi.positions:
         await db.delete(old_pos)
     await db.flush()
@@ -492,11 +591,10 @@ async def update_connect_data_item(
             connect_data_item_id=cdi.id,
             position_number=pos.position_number,
             core_data_item_id=pos.core_data_item_id,
+            connect_data_item_ref_id=pos.connect_data_item_ref_id,
         ))
 
-    # Replace Neo4J relationships
     inactivate_neo4j_relationships(cdi_id)
-    resolved = [(p.position_number, p.core_data_item_id) for p in positions]
     try:
         create_neo4j_relationships(cdi.id, connect_id, resolved, schema_positions)
     except Exception as e:
@@ -585,33 +683,33 @@ async def upload_excel(
     headers = [str(h).strip() if h else "" for h in rows[0]]
     data_rows = rows[1:]
 
-    core_names = []
+    # Build column names per position (Core name or Connect name)
+    position_names = []
     for sp in schema_positions:
-        core = (await db.execute(select(Core).where(Core.id == sp.core_id))).scalar_one_or_none()
-        core_names.append(core.name if core else sp.core_id)
+        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+        if node_type == 'CORE' and sp.core_id:
+            core = (await db.execute(select(Core).where(Core.id == sp.core_id))).scalar_one_or_none()
+            position_names.append(core.name if core else sp.core_id)
+        elif sp.connect_ref_id:
+            ref_connect = (await db.execute(select(Connect).where(Connect.id == sp.connect_ref_id))).scalar_one_or_none()
+            position_names.append(ref_connect.name if ref_connect else sp.connect_ref_id)
+        else:
+            position_names.append(f"Position {sp.position_number}")
 
     resolved_count = 0
     unresolved_count = 0
     skipped_duplicates = 0
     unresolved_details = []
 
-    # Pre-load existing fingerprints for duplicate detection
     existing_items = (await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
         .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
     )).scalars().all()
-    existing_fingerprints = {
-        "|".join(
-            f"{p.position_number}:{p.core_data_item_id}"
-            for p in sorted(item.positions, key=lambda x: x.position_number)
-        )
-        for item in existing_items
-    }
+    existing_fingerprints = {_make_fingerprint(item.positions) for item in existing_items}
 
     for row_num, row in enumerate(data_rows, start=2):
         row_values = [str(v).strip() if v is not None else "" for v in row]
-
         if all(v == "" for v in row_values):
             continue
 
@@ -620,7 +718,7 @@ async def upload_excel(
         row_errors = []
 
         for i, sp in enumerate(schema_positions):
-            col_name = core_names[i]
+            col_name = position_names[i]
             try:
                 col_idx = headers.index(col_name)
                 value = row_values[col_idx] if col_idx < len(row_values) else ""
@@ -633,53 +731,55 @@ async def upload_excel(
                 continue
 
             value = value.lstrip("ID_").rstrip("|")
+            node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
 
-            item = (await db.execute(
-                select(CoreDataItem).where(
-                    CoreDataItem.english_value == value,
-                    CoreDataItem.core_id == sp.core_id,
-                    CoreDataItem.status == StatusEnum.ACTIVE,
-                )
-            )).scalar_one_or_none()
-
-            if not item:
-                row_errors.append(f"position {sp.position_number}: '{value}' not found in Core '{col_name}'")
-                row_failed = True
+            if node_type == 'CORE':
+                item = (await db.execute(
+                    select(CoreDataItem).where(
+                        CoreDataItem.english_value == value,
+                        CoreDataItem.core_id == sp.core_id,
+                        CoreDataItem.status == StatusEnum.ACTIVE,
+                    )
+                )).scalar_one_or_none()
+                if not item:
+                    row_errors.append(f"position {sp.position_number}: '{value}' not found in Core '{col_name}'")
+                    row_failed = True
+                else:
+                    resolved_positions.append((sp.position_number, item.id, None))
             else:
-                resolved_positions.append((sp.position_number, item.id))
+                # Excel upload for Connect-type positions is not yet supported
+                row_errors.append(f"position {sp.position_number}: Excel upload for Connect-type positions is not yet supported — use manual entry")
+                row_failed = True
 
         if row_failed:
             unresolved_count += 1
             unresolved_details.append({"row": row_num, "errors": row_errors})
             continue
 
-        # Skip exact duplicates silently
         row_fingerprint = "|".join(
             f"{pos_num}:{item_id}"
-            for pos_num, item_id in sorted(resolved_positions, key=lambda x: x[0])
+            for pos_num, item_id, _ in sorted(resolved_positions, key=lambda x: x[0])
         )
         if row_fingerprint in existing_fingerprints:
             skipped_duplicates += 1
             continue
         existing_fingerprints.add(row_fingerprint)
 
-        cdi = ConnectDataItem(
-            connect_id=connect_id,
-            status=StatusEnum.ACTIVE,
-            created_by=current_user.id,
-        )
+        cdi = ConnectDataItem(connect_id=connect_id, status=StatusEnum.ACTIVE, created_by=current_user.id)
         db.add(cdi)
         await db.flush()
 
-        for pos_num, item_id in resolved_positions:
+        for pos_num, item_id, _ in resolved_positions:
             db.add(ConnectDataPosition(
                 connect_data_item_id=cdi.id,
                 position_number=pos_num,
                 core_data_item_id=item_id,
+                connect_data_item_ref_id=None,
             ))
 
+        neo_resolved = [(pos_num, item_id) for pos_num, item_id, _ in resolved_positions]
         try:
-            create_neo4j_relationships(cdi.id, connect_id, resolved_positions, schema_positions)
+            create_neo4j_relationships(cdi.id, connect_id, neo_resolved, schema_positions)
             resolved_count += 1
         except Exception as e:
             await db.rollback()
