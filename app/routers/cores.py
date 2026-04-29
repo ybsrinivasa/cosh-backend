@@ -361,6 +361,71 @@ async def create_item(
     return result.scalar_one()
 
 
+@router.post("/{core_id}/items/upload-image", response_model=CoreDataItemOut, status_code=status.HTTP_201_CREATED)
+async def upload_image(
+    core_id: str,
+    file: UploadFile = File(...),
+    name: str = Query(..., description="Display name for this image"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """Upload an image file to S3 and create a MEDIA Core item in one step."""
+    from app.services.s3_service import upload_image_to_s3
+
+    core = await get_core(db, core_id, current_user)
+    check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
+    if core.core_type != CoreType.MEDIA:
+        raise HTTPException(status_code=422, detail="Image upload is only for MEDIA cores")
+
+    existing = (await db.execute(
+        select(CoreDataItem).where(
+            CoreDataItem.core_id == core_id,
+            CoreDataItem.english_value.ilike(name.strip())
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail="An item with this name already exists in the Core")
+
+    file_bytes = await file.read()
+    s3_url = upload_image_to_s3(file_bytes, file.filename or "image.jpg", core_id)
+
+    item = CoreDataItem(
+        core_id=core_id,
+        english_value=name.strip(),
+        status=StatusEnum.ACTIVE,
+        created_by=current_user.id,
+    )
+    db.add(item)
+    await db.flush()
+
+    db.add(MediaItem(
+        item_id=item.id,
+        s3_url=s3_url,
+        content_type=core.content_type or ContentType.IMAGE,
+        file_size_bytes=len(file_bytes),
+    ))
+
+    try:
+        await dual_write_create(db, item)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Neo4J write failed: {str(e)}")
+
+    await write_sync_changes(db, EntityType.CORE_DATA_ITEM, item.id, ChangeType.ADDED, core_id=core_id)
+    await db.commit()
+
+    result = await db.execute(
+        select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.id == item.id)
+    )
+    created_item = result.scalar_one()
+    return {
+        "id": created_item.id, "core_id": created_item.core_id,
+        "english_value": created_item.english_value, "status": created_item.status,
+        "legacy_item_id": created_item.legacy_item_id, "created_by_name": None,
+        "s3_url": s3_url, "created_at": created_item.created_at, "translations": [],
+    }
+
+
 @router.put("/{core_id}/items/{item_id}", response_model=CoreDataItemOut)
 async def update_item(
     core_id: str,
