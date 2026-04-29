@@ -84,7 +84,7 @@ async def update_connect(
 
     if request.description is not None:
         connect.description = request.description
-    if request.assigned_stocker_id is not None:
+    if 'assigned_stocker_id' in request.model_fields_set:
         connect.assigned_stocker_id = request.assigned_stocker_id
 
     await db.commit()

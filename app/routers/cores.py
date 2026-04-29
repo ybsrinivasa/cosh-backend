@@ -100,7 +100,7 @@ async def update_core(
         core.description = request.description
     if request.language_mode is not None:
         core.language_mode = request.language_mode
-    if request.assigned_stocker_id is not None:
+    if 'assigned_stocker_id' in request.model_fields_set:
         core.assigned_stocker_id = request.assigned_stocker_id
 
     await db.commit()
