@@ -38,7 +38,7 @@ echo ">> Creating full-text index for similarity search..."
 run_cypher "CREATE FULLTEXT INDEX cdi_english IF NOT EXISTS FOR (n:CoreDataItem) ON EACH [n.english_value];"
 
 echo ">> Verifying indexes..."
-run_cypher "CALL db.indexes() YIELD name, type, state RETURN name, type, state;"
+run_cypher "SHOW INDEXES YIELD name, type, state RETURN name, type, state;"
 
 echo ""
 echo "=== Neo4J init complete ==="
