@@ -55,10 +55,11 @@ services:
       - /data/neo4j/data:/data
       - /data/neo4j/logs:/logs
       - /data/neo4j/plugins:/plugins
+    # No host port binding needed — API connects via Docker network (neo4j:7687)
+    # To access Neo4J browser for debugging: docker exec -it cosh-backend-neo4j-1 cypher-shell -u neo4j -p $NEO4J_PASSWORD
     expose:
-      - "7687"   # Bolt — used by app
-    ports:
-      - "127.0.0.1:7474:7474"  # Browser — localhost only (SSH tunnel to access)
+      - "7687"
+      - "7474"
     healthcheck:
       test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
       interval: 30s
