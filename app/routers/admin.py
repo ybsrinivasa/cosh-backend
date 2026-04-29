@@ -29,6 +29,20 @@ class RelTypeUpdate(BaseModel):
     description: Optional[str] = None
     example: Optional[str] = None
 
+
+class ProductCreate(BaseModel):
+    name: str                                    # machine identifier: rootstalk, pestest
+    display_name: str                            # human label: RootsTalk
+    sync_endpoint_url: Optional[str] = None     # URL Cosh POSTs payload to
+    sync_api_key: Optional[str] = None          # shared secret sent in Authorization header
+
+
+class ProductUpdate(BaseModel):
+    display_name: Optional[str] = None
+    sync_endpoint_url: Optional[str] = None
+    sync_api_key: Optional[str] = None
+    status: Optional[StatusEnum] = None
+
 router = APIRouter(prefix="/admin", tags=["Admin"])
 require_admin = require_role(UserRole.ADMIN)
 require_designer_or_admin = require_role(UserRole.DESIGNER, UserRole.ADMIN)
@@ -324,7 +338,78 @@ async def update_relationship_type(
 async def list_products(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ProductRegistry).order_by(ProductRegistry.display_name))
     return [
-        {"id": p.id, "name": p.name, "display_name": p.display_name,
-         "sync_endpoint_url": p.sync_endpoint_url, "status": p.status.value}
+        {
+            "id": p.id,
+            "name": p.name,
+            "display_name": p.display_name,
+            "sync_endpoint_url": p.sync_endpoint_url,
+            "sync_api_key": p.sync_api_key_secret_name,   # field reused as direct key store
+            "status": p.status.value,
+        }
         for p in result.scalars().all()
     ]
+
+
+@router.post("/registries/products", status_code=http_status.HTTP_201_CREATED)
+async def create_product(
+    request: ProductCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_admin),
+):
+    # name must be lowercase, no spaces
+    name = request.name.strip().lower().replace(" ", "_")
+    existing = (await db.execute(
+        select(ProductRegistry).where(ProductRegistry.name == name)
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"A product with identifier '{name}' already exists")
+
+    product = ProductRegistry(
+        name=name,
+        display_name=request.display_name.strip(),
+        sync_endpoint_url=request.sync_endpoint_url or None,
+        sync_api_key_secret_name=request.sync_api_key or None,
+        status=StatusEnum.ACTIVE,
+        added_by=current_user.id,
+    )
+    db.add(product)
+    await db.commit()
+    await db.refresh(product)
+    return {
+        "id": product.id, "name": product.name, "display_name": product.display_name,
+        "sync_endpoint_url": product.sync_endpoint_url,
+        "sync_api_key": product.sync_api_key_secret_name,
+        "status": product.status.value,
+    }
+
+
+@router.put("/registries/products/{product_id}")
+async def update_product(
+    product_id: str,
+    request: ProductUpdate,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    product = (await db.execute(
+        select(ProductRegistry).where(ProductRegistry.id == product_id)
+    )).scalar_one_or_none()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    if request.display_name is not None:
+        product.display_name = request.display_name.strip()
+    if request.sync_endpoint_url is not None:
+        product.sync_endpoint_url = request.sync_endpoint_url.strip() or None
+    if request.sync_api_key is not None:
+        product.sync_api_key_secret_name = request.sync_api_key.strip() or None
+    if request.status is not None:
+        product.status = request.status
+
+    await db.commit()
+    await db.refresh(product)
+    return {
+        "id": product.id, "name": product.name, "display_name": product.display_name,
+        "sync_endpoint_url": product.sync_endpoint_url,
+        "sync_api_key": product.sync_api_key_secret_name,
+        "status": product.status.value,
+    }
