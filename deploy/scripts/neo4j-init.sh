@@ -10,6 +10,22 @@ NEO4J_PASSWORD=$(grep NEO4J_PASSWORD "$BACKEND_DIR/.env" | cut -d= -f2)
 
 echo "=== Neo4J Schema Init ==="
 
+# Wait for Neo4J container to be fully running (not restarting)
+echo ">> Waiting for Neo4J container to be ready..."
+for i in $(seq 1 30); do
+    STATUS=$(docker compose -f "$BACKEND_DIR/docker-compose.prod.yml" ps --format json neo4j 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0]['State'] if isinstance(d,list) else d['State'])" 2>/dev/null || echo "unknown")
+    if [ "$STATUS" = "running" ]; then
+        echo "   Neo4J is running."
+        break
+    fi
+    echo "   Status: $STATUS — waiting 10s ($i/30)..."
+    sleep 10
+done
+
+# Wait a further 30s for bolt to be fully ready inside the container
+echo ">> Waiting 30s for Bolt to initialise..."
+sleep 30
+
 run_cypher() {
     docker compose -f "$BACKEND_DIR/docker-compose.prod.yml" exec -T neo4j \
         cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "$1"
