@@ -37,6 +37,10 @@ echo ">> Running database migrations..."
 docker compose -f docker-compose.prod.yml run --rm api \
     alembic upgrade head
 
+echo ">> Seeding database (admin user, registries — skips if already exists)..."
+docker compose -f docker-compose.prod.yml run --rm api \
+    python scripts/seed_db.py
+
 echo ">> Restarting API and Celery workers..."
 docker compose -f docker-compose.prod.yml up -d --force-recreate api celery
 
