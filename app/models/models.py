@@ -267,7 +267,10 @@ class Connect(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     product_tags: Mapped[list["ConnectProductTag"]] = relationship("ConnectProductTag", back_populates="connect")
-    schema_positions: Mapped[list["ConnectSchemaPosition"]] = relationship("ConnectSchemaPosition", back_populates="connect")
+    schema_positions: Mapped[list["ConnectSchemaPosition"]] = relationship(
+        "ConnectSchemaPosition", back_populates="connect",
+        foreign_keys="ConnectSchemaPosition.connect_id"
+    )
     data_items: Mapped[list["ConnectDataItem"]] = relationship("ConnectDataItem", back_populates="connect")
 
 
@@ -295,7 +298,10 @@ class ConnectSchemaPosition(Base):
     connect_ref_id: Mapped[str] = mapped_column(String(36), ForeignKey("connects.id"), nullable=True)
     relationship_type_to_next: Mapped[str] = mapped_column(String(200), nullable=True)
 
-    connect: Mapped["Connect"] = relationship("Connect", back_populates="schema_positions", foreign_keys="ConnectSchemaPosition.connect_id")
+    connect: Mapped["Connect"] = relationship(
+        "Connect", back_populates="schema_positions",
+        foreign_keys="[ConnectSchemaPosition.connect_id]"
+    )
 
     __table_args__ = (UniqueConstraint("connect_id", "position_number"),)
 
@@ -311,7 +317,10 @@ class ConnectDataItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     connect: Mapped["Connect"] = relationship("Connect", back_populates="data_items")
-    positions: Mapped[list["ConnectDataPosition"]] = relationship("ConnectDataPosition", back_populates="data_item")
+    positions: Mapped[list["ConnectDataPosition"]] = relationship(
+        "ConnectDataPosition", back_populates="data_item",
+        foreign_keys="[ConnectDataPosition.connect_data_item_id]"
+    )
 
 
 class ConnectDataPosition(Base):
@@ -323,7 +332,10 @@ class ConnectDataPosition(Base):
     core_data_item_id: Mapped[str] = mapped_column(String(36), ForeignKey("core_data_items.id"), nullable=True)
     connect_data_item_ref_id: Mapped[str] = mapped_column(String(36), ForeignKey("connect_data_items.id"), nullable=True)
 
-    data_item: Mapped["ConnectDataItem"] = relationship("ConnectDataItem", back_populates="positions", foreign_keys="ConnectDataPosition.connect_data_item_id")
+    data_item: Mapped["ConnectDataItem"] = relationship(
+        "ConnectDataItem", back_populates="positions",
+        foreign_keys="[ConnectDataPosition.connect_data_item_id]"
+    )
 
     __table_args__ = (UniqueConstraint("connect_data_item_id", "position_number"),)
 
