@@ -56,16 +56,12 @@ services:
       - /data/neo4j/logs:/logs
       - /data/neo4j/plugins:/plugins
     # No host port binding needed — API connects via Docker network (neo4j:7687)
-    # To access Neo4J browser for debugging: docker exec -it cosh-backend-neo4j-1 cypher-shell -u neo4j -p $NEO4J_PASSWORD
+    # To debug: docker exec -it cosh-backend-neo4j-1 cypher-shell -u neo4j -p PASSWORD
     expose:
       - "7687"
       - "7474"
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474/ || exit 1"]
-      interval: 20s
-      timeout: 10s
-      retries: 20
-      start_period: 120s
+    # No healthcheck — Neo4J 5 community image has no reliable built-in probe tool.
+    # The API handles Neo4J connection retries at startup via the driver.
 
   # ── FastAPI ─────────────────────────────────────────────────────────────────
   api:
@@ -82,7 +78,7 @@ services:
       redis:
         condition: service_healthy
       neo4j:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
