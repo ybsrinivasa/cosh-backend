@@ -7,7 +7,7 @@ from app.database import get_db
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Connect, ConnectSchemaPosition, ConnectDataItem, ConnectDataPosition,
-    ConnectProductTag, ProductRegistry, CoreDataItem, Core,
+    ConnectProductTag, ProductRegistry, CoreDataItem, Core, User,
     UserRole, StatusEnum
 )
 from app.schemas.connects import (
@@ -270,13 +270,33 @@ async def list_connect_data_items(
     current_user=Depends(require_designer_or_stocker),
 ):
     await get_connect(db, connect_id, current_user)
-    result = await db.execute(
+    items = (await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
         .where(ConnectDataItem.connect_id == connect_id)
         .order_by(ConnectDataItem.created_at)
-    )
-    return result.scalars().all()
+    )).scalars().all()
+
+    # Resolve creator names in one batch query
+    user_ids = list({item.created_by for item in items if item.created_by})
+    user_map: dict = {}
+    if user_ids:
+        users = (await db.execute(
+            select(User.id, User.name, User.email).where(User.id.in_(user_ids))
+        )).all()
+        user_map = {u.id: u.name or u.email for u in users}
+
+    return [
+        {
+            "id": item.id,
+            "connect_id": item.connect_id,
+            "status": item.status,
+            "created_by_name": user_map.get(item.created_by),
+            "created_at": item.created_at,
+            "positions": item.positions,
+        }
+        for item in items
+    ]
 
 
 @router.post("/{connect_id}/items", response_model=ConnectDataItemOut, status_code=status.HTTP_201_CREATED)

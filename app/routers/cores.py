@@ -9,7 +9,7 @@ from app.database import get_db
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
-    CoreProductTag, ProductRegistry, LanguageRegistry,
+    CoreProductTag, ProductRegistry, LanguageRegistry, User,
     UserRole, StatusEnum, CoreType, ValidationStatus
 )
 from app.schemas.cores import (
@@ -253,8 +253,31 @@ async def list_items(
     q = select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.core_id == core_id)
     if status_filter in ("ACTIVE", "INACTIVE"):
         q = q.where(CoreDataItem.status == StatusEnum(status_filter))
-    result = await db.execute(q.order_by(CoreDataItem.english_value))
-    return result.scalars().all()
+    items = (await db.execute(q.order_by(CoreDataItem.english_value))).scalars().all()
+
+    # Resolve creator names in one batch query
+    user_ids = list({item.created_by for item in items if item.created_by})
+    user_map: dict = {}
+    if user_ids:
+        users = (await db.execute(
+            select(User.id, User.name, User.email).where(User.id.in_(user_ids))
+        )).all()
+        user_map = {u.id: u.name or u.email for u in users}
+
+    # Return dicts with creator names — FastAPI validates against CoreDataItemOut
+    return [
+        {
+            "id": item.id,
+            "core_id": item.core_id,
+            "english_value": item.english_value,
+            "status": item.status,
+            "legacy_item_id": item.legacy_item_id,
+            "created_by_name": user_map.get(item.created_by),
+            "created_at": item.created_at,
+            "translations": item.translations,
+        }
+        for item in items
+    ]
 
 
 @router.post("/{core_id}/items", response_model=CoreDataItemOut, status_code=status.HTTP_201_CREATED)

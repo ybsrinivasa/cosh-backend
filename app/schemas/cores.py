@@ -90,6 +90,7 @@ class CoreDataItemOut(BaseModel):
     english_value: str
     status: StatusEnum
     legacy_item_id: Optional[str]
+    created_by_name: Optional[str] = None
     created_at: datetime
     translations: List[TranslationOut] = []
 

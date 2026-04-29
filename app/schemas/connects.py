@@ -66,6 +66,7 @@ class ConnectDataItemOut(BaseModel):
     id: str
     connect_id: str
     status: StatusEnum
+    created_by_name: Optional[str] = None
     created_at: datetime
     positions: List[ConnectDataPositionOut] = []
 
