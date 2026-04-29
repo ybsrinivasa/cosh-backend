@@ -15,12 +15,13 @@ from app.neo4j_db import driver
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 require_admin = require_role(UserRole.ADMIN)
+require_designer_or_admin = require_role(UserRole.DESIGNER, UserRole.ADMIN)
 
 
 @router.get("/migration/status")
 async def migration_status(
     db: AsyncSession = Depends(get_db),
-    _=Depends(require_admin),
+    _=Depends(require_designer_or_admin),
 ):
     """
     P7-04: Live migration status dashboard.
