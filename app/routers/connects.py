@@ -102,7 +102,28 @@ async def get_schema(connect_id: str, db: AsyncSession = Depends(get_db), curren
         .where(ConnectSchemaPosition.connect_id == connect_id)
         .order_by(ConnectSchemaPosition.position_number)
     )
-    return result.scalars().all()
+    positions = result.scalars().all()
+    if not positions:
+        return []
+
+    # Enrich each position with Core name — avoids frontend needing a separate Core lookup
+    core_ids = list({p.core_id for p in positions})
+    cores = (await db.execute(
+        select(Core.id, Core.name).where(Core.id.in_(core_ids))
+    )).all()
+    core_name_map = {c.id: c.name for c in cores}
+
+    return [
+        SchemaPositionOut(
+            id=p.id,
+            connect_id=p.connect_id,
+            position_number=p.position_number,
+            core_id=p.core_id,
+            core_name=core_name_map.get(p.core_id),
+            relationship_type_to_next=p.relationship_type_to_next,
+        )
+        for p in positions
+    ]
 
 
 @router.post("/{connect_id}/schema", response_model=list[SchemaPositionOut], status_code=status.HTTP_201_CREATED)

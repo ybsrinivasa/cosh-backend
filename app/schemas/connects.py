@@ -26,6 +26,7 @@ class SchemaPositionOut(BaseModel):
     connect_id: str
     position_number: int
     core_id: str
+    core_name: Optional[str] = None
     relationship_type_to_next: Optional[str]
 
     class Config:
