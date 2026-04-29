@@ -355,6 +355,109 @@ async def create_connect_data_item(
     return result.scalar_one()
 
 
+# ── Connect Data Edit ─────────────────────────────────────────────────────────
+
+@router.put("/{connect_id}/items/{cdi_id}", response_model=ConnectDataItemOut)
+async def update_connect_data_item(
+    connect_id: str,
+    cdi_id: str,
+    positions: list[ConnectDataPositionIn],
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """Edit a Connect Data row by replacing its positions. Neo4J relationships are updated atomically."""
+    connect = await get_connect(db, connect_id, current_user)
+    check_stocker_exclusive_write(connect.assigned_stocker_id, current_user)
+
+    cdi = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.id == cdi_id, ConnectDataItem.connect_id == connect_id)
+    )).scalar_one_or_none()
+    if not cdi:
+        raise HTTPException(status_code=404, detail="Connect Data Item not found")
+    if cdi.status != StatusEnum.ACTIVE:
+        raise HTTPException(status_code=422, detail="Cannot edit an inactive data row")
+
+    schema_result = await db.execute(
+        select(ConnectSchemaPosition)
+        .where(ConnectSchemaPosition.connect_id == connect_id)
+        .order_by(ConnectSchemaPosition.position_number)
+    )
+    schema_positions = schema_result.scalars().all()
+
+    if len(positions) != len(schema_positions):
+        raise HTTPException(status_code=422, detail=f"Expected {len(schema_positions)} positions, got {len(positions)}")
+
+    schema_map = {p.position_number: p for p in schema_positions}
+    for pos in positions:
+        if pos.position_number not in schema_map:
+            raise HTTPException(status_code=422, detail=f"Position {pos.position_number} not in schema")
+        schema_pos = schema_map[pos.position_number]
+        item = (await db.execute(
+            select(CoreDataItem).where(
+                CoreDataItem.id == pos.core_data_item_id,
+                CoreDataItem.core_id == schema_pos.core_id,
+                CoreDataItem.status == StatusEnum.ACTIVE,
+            )
+        )).scalar_one_or_none()
+        if not item:
+            raise HTTPException(status_code=422, detail=f"Position {pos.position_number}: item not found or inactive in the expected Core")
+
+    # Duplicate check — exclude this row itself
+    new_fingerprint = "|".join(
+        f"{p.position_number}:{p.core_data_item_id}"
+        for p in sorted(positions, key=lambda x: x.position_number)
+    )
+    other_items = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(
+            ConnectDataItem.connect_id == connect_id,
+            ConnectDataItem.status == StatusEnum.ACTIVE,
+            ConnectDataItem.id != cdi_id,
+        )
+    )).scalars().all()
+    for other in other_items:
+        other_fp = "|".join(
+            f"{p.position_number}:{p.core_data_item_id}"
+            for p in sorted(other.positions, key=lambda x: x.position_number)
+        )
+        if other_fp == new_fingerprint:
+            raise HTTPException(status_code=409, detail="This combination already exists in this Connect")
+
+    # Replace positions
+    for old_pos in cdi.positions:
+        await db.delete(old_pos)
+    await db.flush()
+
+    for pos in positions:
+        db.add(ConnectDataPosition(
+            connect_data_item_id=cdi.id,
+            position_number=pos.position_number,
+            core_data_item_id=pos.core_data_item_id,
+        ))
+
+    # Replace Neo4J relationships
+    inactivate_neo4j_relationships(cdi_id)
+    resolved = [(p.position_number, p.core_data_item_id) for p in positions]
+    try:
+        create_neo4j_relationships(cdi.id, connect_id, resolved, schema_positions)
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Neo4J write failed: {str(e)}")
+
+    await write_sync_changes(db, EntityType.CONNECT_DATA_ITEM, cdi.id, ChangeType.UPDATED, connect_id=connect_id)
+    await db.commit()
+
+    result = await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.id == cdi.id)
+    )
+    return result.scalar_one()
+
+
 # ── Connect Data Status ────────────────────────────────────────────────────────
 
 @router.put("/{connect_id}/items/{cdi_id}/status", response_model=ConnectDataItemOut)
