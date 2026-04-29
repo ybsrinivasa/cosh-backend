@@ -9,8 +9,8 @@ from app.database import get_db
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
-    CoreProductTag, ProductRegistry, LanguageRegistry, User,
-    UserRole, StatusEnum, CoreType, ValidationStatus
+    CoreProductTag, ProductRegistry, LanguageRegistry, User, MediaItem,
+    UserRole, StatusEnum, CoreType, ContentType, ValidationStatus
 )
 from app.schemas.cores import (
     CoreCreate, CoreUpdate, CoreStatusUpdate, CoreOut,
@@ -264,7 +264,17 @@ async def list_items(
         )).all()
         user_map = {u.id: u.name or u.email for u in users}
 
-    # Return dicts with creator names — FastAPI validates against CoreDataItemOut
+    # Batch-load s3_url for MEDIA cores
+    media_map: dict = {}
+    core_obj = (await db.execute(select(Core).where(Core.id == core_id))).scalar_one_or_none()
+    if core_obj and core_obj.core_type == CoreType.MEDIA:
+        item_ids = [item.id for item in items]
+        if item_ids:
+            media_rows = (await db.execute(
+                select(MediaItem.item_id, MediaItem.s3_url).where(MediaItem.item_id.in_(item_ids))
+            )).all()
+            media_map = {m.item_id: m.s3_url for m in media_rows}
+
     return [
         {
             "id": item.id,
@@ -273,6 +283,7 @@ async def list_items(
             "status": item.status,
             "legacy_item_id": item.legacy_item_id,
             "created_by_name": user_map.get(item.created_by),
+            "s3_url": media_map.get(item.id),
             "created_at": item.created_at,
             "translations": item.translations,
         }
@@ -289,6 +300,9 @@ async def create_item(
 ):
     core = await get_core(db, core_id, current_user)
     check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
+
+    if core.core_type == CoreType.MEDIA and not request.s3_url:
+        raise HTTPException(status_code=422, detail="s3_url is required for MEDIA cores")
 
     existing = (await db.execute(
         select(CoreDataItem).where(
@@ -307,6 +321,13 @@ async def create_item(
     )
     db.add(item)
     await db.flush()
+
+    if core.core_type == CoreType.MEDIA and request.s3_url:
+        db.add(MediaItem(
+            item_id=item.id,
+            s3_url=request.s3_url,
+            content_type=core.content_type or ContentType.IMAGE,
+        ))
 
     try:
         await dual_write_create(db, item)
@@ -356,6 +377,17 @@ async def update_item(
 
     item.english_value = request.english_value
     await dual_write_update_english(item_id, request.english_value)
+
+    if core.core_type == CoreType.MEDIA and request.s3_url is not None:
+        media_item = (await db.execute(
+            select(MediaItem).where(MediaItem.item_id == item_id)
+        )).scalar_one_or_none()
+        if media_item:
+            media_item.s3_url = request.s3_url
+        else:
+            db.add(MediaItem(item_id=item_id, s3_url=request.s3_url,
+                             content_type=core.content_type or ContentType.IMAGE))
+
     await write_sync_changes(db, EntityType.CORE_DATA_ITEM, item_id, ChangeType.UPDATED, core_id=core_id)
     await db.commit()
     await db.refresh(item)
@@ -408,16 +440,15 @@ async def upload_csv(
     current_user=Depends(require_designer_or_stocker),
 ):
     """
-    P2-06 / P7-02: Bulk CSV upload for TEXT cores.
-    Columns: english_value (required), legacy_id (optional),
-    plus any number of language columns: {lang}_value and {lang}_validation_status.
-    Language columns allow migration of pre-translated content in one shot.
+    P2-06 / P7-02: Bulk CSV upload for TEXT and MEDIA cores.
+    TEXT columns: english_value (required), legacy_id (optional),
+    plus language columns: {lang}_value and {lang}_validation_status.
+    MEDIA columns: English_name (required), English_url (required), id (optional as legacy_id).
     Expert-validated translations are never overwritten by auto-translation.
     """
     core = await get_core(db, core_id, current_user)
     check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
-    if core.core_type.value != "TEXT":
-        raise HTTPException(status_code=422, detail="CSV upload is only for TEXT cores")
+    is_media = core.core_type == CoreType.MEDIA
 
     content = await file.read()
     try:
@@ -446,10 +477,25 @@ async def upload_csv(
     errors = []
 
     for i, row in enumerate(rows, start=2):
-        english_value = (row.get("english_value") or row.get("English_value") or "").strip()
+        # Support both TEXT and MEDIA name columns
+        english_value = (
+            row.get("english_value") or row.get("English_value") or
+            row.get("English_name") or row.get("english_name") or ""
+        ).strip()
         if not english_value:
-            errors.append(f"Row {i}: empty english_value — skipped")
+            errors.append(f"Row {i}: empty name — skipped")
             continue
+
+        # MEDIA: require a URL column
+        s3_url = None
+        if is_media:
+            s3_url = (
+                row.get("English_url") or row.get("english_url") or
+                row.get("s3_url") or row.get("url") or ""
+            ).strip()
+            if not s3_url or s3_url == "---":
+                errors.append(f"Row {i}: '{english_value}' — missing English_url, skipped")
+                continue
 
         existing = (await db.execute(
             select(CoreDataItem).where(
@@ -460,8 +506,17 @@ async def upload_csv(
 
         if existing:
             skipped += 1
-            # Still import translations for existing items if language columns present
             item = existing
+            # For MEDIA: update URL if changed
+            if is_media and s3_url:
+                existing_media = (await db.execute(
+                    select(MediaItem).where(MediaItem.item_id == existing.id)
+                )).scalar_one_or_none()
+                if existing_media and existing_media.s3_url != s3_url:
+                    existing_media.s3_url = s3_url
+                elif not existing_media:
+                    db.add(MediaItem(item_id=existing.id, s3_url=s3_url,
+                                     content_type=core.content_type or ContentType.IMAGE))
         else:
             item = CoreDataItem(
                 core_id=core_id,
@@ -473,6 +528,10 @@ async def upload_csv(
             db.add(item)
             await db.flush()
 
+            if is_media and s3_url:
+                db.add(MediaItem(item_id=item.id, s3_url=s3_url,
+                                 content_type=core.content_type or ContentType.IMAGE))
+
             try:
                 await dual_write_create(db, item)
                 created += 1
@@ -481,7 +540,10 @@ async def upload_csv(
                 errors.append(f"Row {i}: Neo4J write failed — {str(e)}")
                 continue
 
-        # Import language translations from CSV columns (P7-02)
+        if is_media:
+            continue  # No language translations for MEDIA cores
+
+        # Import language translations from CSV columns (TEXT cores only — P7-02)
         for lang, (val_col, status_col) in lang_cols.items():
             translated_value = (row.get(val_col) or "").strip()
             if not translated_value:
@@ -499,7 +561,6 @@ async def upload_csv(
             )).scalar_one_or_none()
 
             if existing_trans:
-                # Never overwrite EXPERT_VALIDATED with machine-generated
                 if existing_trans.validation_status == ValidationStatus.EXPERT_VALIDATED and not is_expert:
                     continue
                 existing_trans.translated_value = translated_value

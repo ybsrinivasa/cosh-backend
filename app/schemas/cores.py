@@ -62,10 +62,12 @@ class CoreProductTagOut(BaseModel):
 
 class CoreDataItemCreate(BaseModel):
     english_value: str
+    s3_url: Optional[str] = None
 
 
 class CoreDataItemUpdate(BaseModel):
     english_value: str
+    s3_url: Optional[str] = None
 
 
 class CoreDataItemStatusUpdate(BaseModel):
@@ -91,6 +93,7 @@ class CoreDataItemOut(BaseModel):
     status: StatusEnum
     legacy_item_id: Optional[str]
     created_by_name: Optional[str] = None
+    s3_url: Optional[str] = None
     created_at: datetime
     translations: List[TranslationOut] = []
 
