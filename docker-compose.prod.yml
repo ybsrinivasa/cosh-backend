@@ -71,8 +71,8 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
-    expose:
-      - "8000"
+    ports:
+      - "127.0.0.1:8000:8000"   # localhost only — nginx proxies to this
     depends_on:
       postgres:
         condition: service_healthy
@@ -109,8 +109,8 @@ services:
         # Read from .env — use http://IP/api initially, change to https://domain/api after DNS+SSL
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
     restart: unless-stopped
-    expose:
-      - "3000"
+    ports:
+      - "127.0.0.1:3000:3000"   # localhost only — nginx proxies to this
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000"]
       interval: 30s
