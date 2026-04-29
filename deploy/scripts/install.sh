@@ -25,7 +25,7 @@ apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
 # Add ubuntu user to docker group (no sudo needed for docker commands)
-usermod -aG docker ubuntu
+usermod -aG docker newroot
 
 # ── EBS volume mounts ────────────────────────────────────────────────────────
 # Assumes EBS volumes are attached. Format and mount if not already done.
@@ -67,29 +67,29 @@ if [ ! -d "cosh-frontend" ]; then
     git clone https://github.com/ybsrinivasa/cosh-frontend.git
 fi
 
-chown -R ubuntu:ubuntu /home/ubuntu/cosh-backend /home/ubuntu/cosh-frontend
+chown -R newroot:newroot /data/cosh2.0/cosh-backend /data/cosh2.0/cosh-frontend
 
 # ── Nginx config ─────────────────────────────────────────────────────────────
-cp /home/ubuntu/cosh-backend/deploy/nginx.conf /etc/nginx/sites-available/cosh
+cp /data/cosh2.0/cosh-backend/deploy/nginx.conf /etc/nginx/sites-available/cosh
 ln -sf /etc/nginx/sites-available/cosh /etc/nginx/sites-enabled/cosh
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 
 # ── Neo4J backup cron ────────────────────────────────────────────────────────
-cp /home/ubuntu/cosh-backend/deploy/scripts/neo4j-backup.sh /home/ubuntu/neo4j-backup.sh
-chmod +x /home/ubuntu/neo4j-backup.sh
-chown ubuntu:ubuntu /home/ubuntu/neo4j-backup.sh
+cp /data/cosh2.0/cosh-backend/deploy/scripts/neo4j-backup.sh /home/newroot/neo4j-backup.sh
+chmod +x /home/newroot/neo4j-backup.sh
+chown newroot:newroot /home/newroot/neo4j-backup.sh
 
 # Add daily 2 AM cron job for neo4j backup
-(crontab -u ubuntu -l 2>/dev/null; echo "0 2 * * * /home/ubuntu/neo4j-backup.sh >> /var/log/neo4j-backup.log 2>&1") | crontab -u ubuntu -
+(crontab -u newroot -l 2>/dev/null; echo "0 2 * * * /home/newroot/neo4j-backup.sh >> /var/log/neo4j-backup.log 2>&1") | crontab -u newroot -
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Mount EBS volumes (see instructions above)"
-echo "  2. Copy deploy/.env.stage1.example → /home/ubuntu/cosh-backend/.env and fill in values"
-echo "  3. Run: sudo bash /home/ubuntu/cosh-backend/deploy/scripts/deploy.sh"
+echo "  2. Copy deploy/.env.stage1.example → /data/cosh2.0/cosh-backend/.env and fill in values"
+echo "  3. Run: sudo bash /data/cosh2.0/cosh-backend/deploy/scripts/deploy.sh"
 echo "  4. Point DNS: cosh.dev.eywa.farm → this server's Elastic IP"
 echo "  5. Run: sudo certbot --nginx -d cosh.dev.eywa.farm"
-echo "  6. Run: bash /home/ubuntu/cosh-backend/deploy/scripts/neo4j-init.sh"
+echo "  6. Run: bash /data/cosh2.0/cosh-backend/deploy/scripts/neo4j-init.sh"

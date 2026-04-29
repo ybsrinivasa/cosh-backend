@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-BACKEND_DIR=/home/ubuntu/cosh-backend
+BACKEND_DIR=/data/cosh2.0/cosh-backend
 NEO4J_PASSWORD=$(grep NEO4J_PASSWORD "$BACKEND_DIR/.env" | cut -d= -f2)
 
 echo "=== Neo4J Schema Init ==="

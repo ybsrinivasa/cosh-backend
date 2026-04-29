@@ -1,10 +1,10 @@
 #!/bin/bash
 # neo4j-backup.sh — Daily Neo4J dump to S3
-# Cron: 0 2 * * * /home/ubuntu/neo4j-backup.sh >> /var/log/neo4j-backup.log 2>&1
+# Cron: 0 2 * * * /home/newroot/neo4j-backup.sh >> /var/log/neo4j-backup.log 2>&1
 
 set -euo pipefail
 
-BACKEND_DIR=/home/ubuntu/cosh-backend
+BACKEND_DIR=/data/cosh2.0/cosh-backend
 DATE=$(date +%Y-%m-%d)
 DUMP_PATH=/data/neo4j-backup
 S3_BUCKET=tene-drs-prod-media          # reuse media bucket; backups go in a separate prefix

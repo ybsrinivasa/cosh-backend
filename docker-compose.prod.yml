@@ -105,7 +105,7 @@ services:
   # ── Next.js Frontend ────────────────────────────────────────────────────────
   frontend:
     build:
-      context: /home/newroot/cosh-frontend
+      context: /data/cosh2.0/cosh-frontend
       dockerfile: Dockerfile
       args:
         # Read from .env — use http://IP/api initially, change to https://domain/api after DNS+SSL

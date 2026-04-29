@@ -5,9 +5,8 @@
 
 set -euo pipefail
 
-APP_USER=${APP_USER:-newroot}
-BACKEND_DIR=/home/${APP_USER}/cosh-backend
-FRONTEND_DIR=/home/${APP_USER}/cosh-frontend
+BACKEND_DIR=/data/cosh2.0/cosh-backend
+FRONTEND_DIR=/data/cosh2.0/cosh-frontend
 
 echo "=== Cosh 2.0 — Deploy $(date '+%Y-%m-%d %H:%M:%S') ==="
 
