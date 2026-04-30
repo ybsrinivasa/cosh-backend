@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import require_role
-from app.services.auth_service import hash_password, get_user_by_email
+from app.services.auth_service import get_user_by_email
 from app.schemas.auth import CreateUserRequest, UpdateUserStatusRequest, UpdateUserRolesRequest, UserOut
-from app.models.models import User, UserRoleModel, UserRole, StatusEnum
+from app.models.models import User, UserRoleModel, UserRole, StatusEnum, Core, Connect
 
 router = APIRouter(prefix="/admin/users", tags=["Admin — Users"])
 
@@ -37,7 +37,6 @@ async def create_user(
     user = User(
         email=request.email,
         name=request.name,
-        password_hash=hash_password(request.password),
         status=StatusEnum.ACTIVE,
     )
     db.add(user)
@@ -128,3 +127,72 @@ async def list_users_by_role(
     )
     users = result.scalars().all()
     return [{"id": u.id, "name": u.name or u.email, "email": u.email} for u in users]
+
+
+@router.get("/workload", tags=["Admin — Users"])
+async def team_workload(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Returns each Designer/Stocker with their assigned cores and connects."""
+    # Fetch all designer + stocker users
+    team_result = await db.execute(
+        select(User)
+        .join(UserRoleModel, UserRoleModel.user_id == User.id)
+        .where(
+            UserRoleModel.role.in_([UserRole.DESIGNER, UserRole.STOCKER]),
+            UserRoleModel.status == StatusEnum.ACTIVE,
+            User.status == StatusEnum.ACTIVE,
+        )
+        .options(selectinload(User.roles))
+        .order_by(User.name)
+        .distinct()
+    )
+    team = team_result.scalars().all()
+
+    # Cores designed by each user
+    cores_designed_result = await db.execute(
+        select(Core.created_by, Core.id, Core.name, Core.status)
+        .where(Core.created_by.in_([u.id for u in team]))
+    )
+    cores_designed = cores_designed_result.fetchall()
+
+    # Cores assigned to each stocker
+    cores_stocked_result = await db.execute(
+        select(Core.assigned_stocker_id, Core.id, Core.name, Core.status)
+        .where(Core.assigned_stocker_id.in_([u.id for u in team]))
+    )
+    cores_stocked = cores_stocked_result.fetchall()
+
+    # Connects designed by each user
+    connects_designed_result = await db.execute(
+        select(Connect.created_by, Connect.id, Connect.name, Connect.status)
+        .where(Connect.created_by.in_([u.id for u in team]))
+    )
+    connects_designed = connects_designed_result.fetchall()
+
+    # Connects assigned to each stocker
+    connects_stocked_result = await db.execute(
+        select(Connect.assigned_stocker_id, Connect.id, Connect.name, Connect.status)
+        .where(Connect.assigned_stocker_id.in_([u.id for u in team]))
+    )
+    connects_stocked = connects_stocked_result.fetchall()
+
+    def _item(row):
+        return {"id": row[1], "name": row[2], "status": row[3].value}
+
+    workload = []
+    for user in team:
+        active_roles = [r.role.value for r in user.roles if r.status.value == "ACTIVE"]
+        workload.append({
+            "user_id": user.id,
+            "name": user.name or user.email,
+            "email": user.email,
+            "roles": active_roles,
+            "cores_designed": [_item(r) for r in cores_designed if r[0] == user.id],
+            "cores_stocked": [_item(r) for r in cores_stocked if r[0] == user.id],
+            "connects_designed": [_item(r) for r in connects_designed if r[0] == user.id],
+            "connects_stocked": [_item(r) for r in connects_stocked if r[0] == user.id],
+        })
+
+    return workload

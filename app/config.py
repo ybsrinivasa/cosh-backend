@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     # Translation
     google_translate_api_key: str = "placeholder"
 
+    # Email / OTP
+    email_smtp_host: str = "smtp.gmail.com"
+    email_smtp_port: int = 587
+    email_smtp_user: str = ""
+    email_smtp_pass: str = ""
+    email_from: str = ""
+    email_reply_to: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

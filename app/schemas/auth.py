@@ -8,6 +8,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class OtpRequestSchema(BaseModel):
+    email: EmailStr
+
+
+class OtpVerifySchema(BaseModel):
+    email: EmailStr
+    otp_code: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -35,7 +44,6 @@ class UserOut(BaseModel):
 class CreateUserRequest(BaseModel):
     email: EmailStr
     name: str
-    password: str
     roles: List[UserRole]
 
 
