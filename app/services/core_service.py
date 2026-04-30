@@ -74,7 +74,12 @@ async def dual_write_update_english(item_id: str, english_value: str):
 
 
 async def inactivity_cascade(db: AsyncSession, item_id: str):
-    """BL-C-02: Cascade inactivity to all Connect Data Items referencing this item."""
+    """BL-C-02: Cascade inactivity to all Connect Data Items referencing this item.
+    Neo4J writes are best-effort — a failure there never blocks the PostgreSQL update.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
     positions = await db.execute(
         select(ConnectDataPosition.connect_data_item_id)
         .where(ConnectDataPosition.core_data_item_id == item_id)
@@ -88,17 +93,23 @@ async def inactivity_cascade(db: AsyncSession, item_id: str):
             .where(ConnectDataItem.id.in_(connect_data_item_ids))
             .values(status=StatusEnum.INACTIVE)
         )
-        with driver.session() as neo_session:
-            for cdi_id in connect_data_item_ids:
-                neo_session.run(
-                    "MATCH ()-[r {connect_data_item_id: $id}]-() SET r.status = 'INACTIVE'",
-                    id=cdi_id
-                )
+        try:
+            with driver.session() as neo_session:
+                for cdi_id in connect_data_item_ids:
+                    neo_session.run(
+                        "MATCH ()-[r {connect_data_item_id: $id}]-() SET r.status = 'INACTIVE'",
+                        id=cdi_id
+                    )
+        except Exception as e:
+            logger.warning(f"Neo4J relationship inactivation failed (non-fatal): {e}")
 
-    with driver.session() as neo_session:
-        neo_session.run(
-            "MATCH (n:CoreDataItem {id: $id}) SET n.status = 'INACTIVE'",
-            id=item_id
-        )
+    try:
+        with driver.session() as neo_session:
+            neo_session.run(
+                "MATCH (n:CoreDataItem {id: $id}) SET n.status = 'INACTIVE'",
+                id=item_id
+            )
+    except Exception as e:
+        logger.warning(f"Neo4J CoreDataItem inactivation failed (non-fatal): {e}")
 
     return len(connect_data_item_ids)
