@@ -10,7 +10,8 @@ from app.models.models import (
     SyncChangeLog, SyncHistory, ProductSyncState, ProductRegistry,
     CoreProductTag, ConnectProductTag, Core, Connect,
     CoreDataItem, CoreDataTranslation, ConnectDataItem, ConnectDataPosition,
-    ConnectSchemaPosition, EntityType, ChangeType, SyncMode, SyncStatus, StatusEnum,
+    ConnectSchemaPosition, RelationshipTypeRegistry,
+    EntityType, ChangeType, SyncMode, SyncStatus, StatusEnum,
 )
 
 # Dependency ordering from RootsTalk Sync API Contract §5.1
@@ -253,12 +254,17 @@ async def build_payload(
     initiated_by: str,
 ) -> dict:
     """
-    Build the JSON payload for RootsTalk per API contract §4.2.
-    Batches are ordered per dependency order in §5.1.
+    Build the enriched JSON payload for RootsTalk.
+    Payload version 2.0 — relationship-type-aware, self-describing.
+
+    Core batches: entity items with all language translations.
+    Connect batches: schema definition (with relationship types) +
+                     structured positions on every data row.
+    RootsTalk can derive its entire schema from this payload.
     """
     product = await get_product(db, product_id)
 
-    # Resolve entity_type_label for each Core and Connect
+    # ── Entity type labels ─────────────────────────────────────────────────────
     core_tags = (await db.execute(
         select(CoreProductTag).where(
             CoreProductTag.product_id == product_id,
@@ -275,7 +281,11 @@ async def build_payload(
     )).scalars().all()
     connect_label_map = {t.connect_id: t.entity_type_label for t in connect_tags}
 
-    # Determine changed item IDs for incremental mode
+    # ── Relationship type display names (batch load once) ─────────────────────
+    rel_type_rows = (await db.execute(select(RelationshipTypeRegistry))).scalars().all()
+    rel_display_map = {r.label: r.display_name for r in rel_type_rows}
+
+    # ── Changed IDs for incremental mode ──────────────────────────────────────
     changed_core_item_ids: set = set()
     changed_connect_item_ids: set = set()
     if sync_mode == SyncMode.INCREMENTAL:
@@ -299,18 +309,7 @@ async def build_payload(
 
         items_q = select(CoreDataItem).where(CoreDataItem.core_id == core_id)
         if sync_mode == SyncMode.INCREMENTAL:
-            # Include items that changed + their translations
-            item_ids_from_translations = [
-                eid for eid in changed_core_item_ids
-                if (await db.execute(
-                    select(CoreDataItem.id).where(
-                        CoreDataItem.id == eid, CoreDataItem.core_id == core_id
-                    )
-                )).scalar_one_or_none()
-            ]
-            relevant_ids = {
-                eid for eid in changed_core_item_ids
-            }
+            relevant_ids = {eid for eid in changed_core_item_ids}
             if not relevant_ids:
                 continue
             items_q = items_q.where(CoreDataItem.id.in_(relevant_ids))
@@ -334,27 +333,46 @@ async def build_payload(
 
             batches[entity_type_label]["items"].append({
                 "cosh_id": item.id,
+                "entity_type": entity_type_label,
                 "status": "active" if item.status == StatusEnum.ACTIVE else "inactive",
-                "parent_cosh_id": None,
-                "secondary_parent_cosh_id": None,
                 "translations": translations,
-                "metadata": {},
             })
 
     # ── Connect entity batches ─────────────────────────────────────────────────
     for connect_id in connect_ids:
         entity_type_label = connect_label_map.get(connect_id) or f"connect_{connect_id[:8]}"
 
-        # Load schema positions to build metadata keys
+        connect_obj = (await db.execute(
+            select(Connect).where(Connect.id == connect_id)
+        )).scalar_one_or_none()
+
+        # Load schema positions
         schema_positions = (await db.execute(
             select(ConnectSchemaPosition)
             .where(ConnectSchemaPosition.connect_id == connect_id)
             .order_by(ConnectSchemaPosition.position_number)
         )).scalars().all()
-        pos_label_map = {}
+
+        # Build schema definition — this is the key new addition
+        schema = []
+        pos_entity_type_map: dict[int, str] = {}
         for sp in schema_positions:
-            core_label = core_label_map.get(sp.core_id)
-            pos_label_map[sp.position_number] = f"{core_label}_cosh_id" if core_label else f"position_{sp.position_number}_cosh_id"
+            node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+            if node_type == 'CONNECT':
+                pos_entity_type = connect_label_map.get(sp.connect_ref_id) or f"connect_{(sp.connect_ref_id or '')[:8]}"
+            else:
+                pos_entity_type = core_label_map.get(sp.core_id) or f"core_{(sp.core_id or '')[:8]}"
+
+            pos_entity_type_map[sp.position_number] = pos_entity_type
+
+            schema.append({
+                "position_number": sp.position_number,
+                "node_type": node_type,
+                "entity_type": pos_entity_type,
+                "relationship_to_next": sp.relationship_type_to_next,
+                "relationship_display_name": rel_display_map.get(sp.relationship_type_to_next)
+                    if sp.relationship_type_to_next else None,
+            })
 
         items_q = select(ConnectDataItem).where(
             ConnectDataItem.connect_id == connect_id,
@@ -370,30 +388,39 @@ async def build_payload(
             continue
 
         if entity_type_label not in batches:
-            batches[entity_type_label] = {"entity_type": entity_type_label, "items": []}
+            batches[entity_type_label] = {
+                "entity_type": entity_type_label,
+                "connect_id": connect_id,
+                "connect_name": connect_obj.name if connect_obj else entity_type_label,
+                "schema": schema,
+                "items": [],
+            }
 
         for cdi in cdis:
-            positions = (await db.execute(
+            data_positions = (await db.execute(
                 select(ConnectDataPosition)
                 .where(ConnectDataPosition.connect_data_item_id == cdi.id)
                 .order_by(ConnectDataPosition.position_number)
             )).scalars().all()
 
-            metadata = {
-                pos_label_map.get(p.position_number, f"position_{p.position_number}_cosh_id"): p.core_data_item_id
-                for p in positions
-            }
+            # Structured positions: position_number → {cosh_id, entity_type}
+            positions_out = {}
+            for p in data_positions:
+                value_id = p.connect_data_item_ref_id or p.core_data_item_id
+                positions_out[str(p.position_number)] = {
+                    "cosh_id": value_id,
+                    "entity_type": pos_entity_type_map.get(p.position_number,
+                                                            f"position_{p.position_number}"),
+                }
 
             batches[entity_type_label]["items"].append({
                 "cosh_id": cdi.id,
-                "status": "active",
-                "parent_cosh_id": None,
-                "secondary_parent_cosh_id": None,
-                "translations": {},
-                "metadata": metadata,
+                "entity_type": entity_type_label,
+                "status": "active" if cdi.status == StatusEnum.ACTIVE else "inactive",
+                "positions": positions_out,
             })
 
-    # Sort batches by dependency order
+    # ── Sort by dependency order and return ───────────────────────────────────
     def _sort_key(label: str) -> int:
         try:
             return _ENTITY_ORDER.index(label)
@@ -403,6 +430,7 @@ async def build_payload(
     sorted_batches = sorted(batches.values(), key=lambda b: _sort_key(b["entity_type"]))
 
     return {
+        "cosh_payload_version": "2.0",
         "sync_id": sync_id,
         "product": product.name,
         "sync_mode": sync_mode.value,
