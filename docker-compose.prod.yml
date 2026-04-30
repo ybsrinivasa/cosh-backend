@@ -114,11 +114,7 @@ services:
       INTERNAL_API_URL: http://api:8000
     ports:
       - "127.0.0.1:3001:3000"   # 3000 may be occupied; nginx proxies host:3001 → container:3000
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    # No healthcheck — slim Next.js image has no curl; nginx handles availability
 
 networks:
   default:
