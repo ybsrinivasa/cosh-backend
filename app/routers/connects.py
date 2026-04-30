@@ -375,7 +375,7 @@ async def list_connect_data_items(
             "id": item.id,
             "connect_id": item.connect_id,
             "status": item.status,
-            "created_by_name": user_map.get(item.created_by),
+            "created_by_name": item.legacy_created_by_name or user_map.get(item.created_by),
             "created_at": item.created_at,
             "positions": item.positions,
         }
@@ -701,6 +701,33 @@ async def upload_excel(
     skipped_duplicates = 0
     unresolved_details = []
 
+    def _parse_xlsx_datetime(val):
+        """Parse creator timestamp from Excel — handles string ISO and Excel datetime objects."""
+        if val is None:
+            return None
+        from datetime import datetime as dt, timezone as tz
+        if isinstance(val, dt):
+            return val.replace(tzinfo=tz.utc) if val.tzinfo is None else val
+        val = str(val).strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S"):
+            try:
+                return dt.strptime(val, fmt).replace(tzinfo=tz.utc)
+            except ValueError:
+                continue
+        return None
+
+    def _get_col(headers, row_values, *names):
+        """Read a cell from a row by trying multiple column name variants."""
+        for name in names:
+            try:
+                idx = next(i for i, h in enumerate(headers) if h.lower() == name.lower())
+                return row_values[idx] if idx < len(row_values) else None
+            except StopIteration:
+                continue
+        return None
+
     existing_items = (await db.execute(
         select(ConnectDataItem)
         .options(selectinload(ConnectDataItem.positions))
@@ -765,7 +792,19 @@ async def upload_excel(
             continue
         existing_fingerprints.add(row_fingerprint)
 
-        cdi = ConnectDataItem(connect_id=connect_id, status=StatusEnum.ACTIVE, created_by=current_user.id)
+        # Read legacy creator/timestamp from Excel if present
+        csv_creator = _get_col(headers, row_values, "Created By", "created_by", "Created by")
+        csv_creator_name = str(csv_creator).strip() if csv_creator and str(csv_creator).strip() not in ("", "---") else None
+        csv_ts = _parse_xlsx_datetime(_get_col(headers, row_values, "Created at", "created_at", "Created At"))
+
+        from app.models.models import utcnow as _utcnow
+        cdi = ConnectDataItem(
+            connect_id=connect_id,
+            status=StatusEnum.ACTIVE,
+            created_by=current_user.id,
+            legacy_created_by_name=csv_creator_name,
+            created_at=csv_ts or _utcnow(),
+        )
         db.add(cdi)
         await db.flush()
 

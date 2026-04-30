@@ -211,6 +211,7 @@ class CoreDataItem(Base):
     status: Mapped[StatusEnum] = mapped_column(SAEnum(StatusEnum), default=StatusEnum.ACTIVE)
     legacy_item_id: Mapped[str] = mapped_column(String(50), nullable=True)
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    legacy_created_by_name: Mapped[str] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -314,6 +315,7 @@ class ConnectDataItem(Base):
     status: Mapped[StatusEnum] = mapped_column(SAEnum(StatusEnum), default=StatusEnum.ACTIVE)
     legacy_connect_data_id: Mapped[str] = mapped_column(String(50), nullable=True)
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    legacy_created_by_name: Mapped[str] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     connect: Mapped["Connect"] = relationship("Connect", back_populates="data_items")

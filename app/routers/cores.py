@@ -282,7 +282,7 @@ async def list_items(
             "english_value": item.english_value,
             "status": item.status,
             "legacy_item_id": item.legacy_item_id,
-            "created_by_name": user_map.get(item.created_by),
+            "created_by_name": item.legacy_created_by_name or user_map.get(item.created_by),
             "s3_url": media_map.get(item.id),
             "created_at": item.created_at,
             "translations": item.translations,
@@ -541,6 +541,22 @@ async def upload_csv(
     translations_imported = 0
     errors = []
 
+    def _parse_csv_datetime(val: str):
+        """Parse datetime from CSV — handles ISO 8601 and common variants."""
+        from datetime import timezone as tz
+        if not val or val.strip() in ("", "---", "null", "None"):
+            return None
+        val = val.strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+            try:
+                from datetime import datetime as dt
+                return dt.strptime(val, fmt).replace(tzinfo=tz.utc)
+            except ValueError:
+                continue
+        return None
+
     for i, row in enumerate(rows, start=2):
         # Support both TEXT and MEDIA name columns
         english_value = (
@@ -569,6 +585,16 @@ async def upload_csv(
             )
         )).scalar_one_or_none()
 
+        # Read legacy creator and timestamp from CSV if present
+        csv_created_by_name = (
+            row.get("Created By") or row.get("created_by") or
+            row.get("Created by") or ""
+        ).strip() or None
+        csv_created_at = _parse_csv_datetime(
+            row.get("Created at") or row.get("created_at") or
+            row.get("Created At") or ""
+        )
+
         if existing:
             skipped += 1
             item = existing
@@ -589,6 +615,8 @@ async def upload_csv(
                 legacy_item_id=row.get("id") or row.get("legacy_id") or None,
                 status=StatusEnum.ACTIVE,
                 created_by=current_user.id,
+                legacy_created_by_name=csv_created_by_name,
+                created_at=csv_created_at or utcnow(),
             )
             db.add(item)
             await db.flush()
