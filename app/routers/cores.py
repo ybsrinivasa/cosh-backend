@@ -681,37 +681,109 @@ async def list_translations(
 async def retranslate_core(
     core_id: str,
     mode: str = Query("machine_generated_only", description="machine_generated_only or all"),
+    lang: str = Query(None, description="Single language code to retranslate. Omit to retranslate all."),
     db: AsyncSession = Depends(get_db),
     _=Depends(require_designer),
 ):
     """
-    Trigger re-translation for all items in a Core.
-    mode=machine_generated_only: safe — preserves EXPERT_VALIDATED translations.
-    mode=all: overwrites everything including EXPERT_VALIDATED. Use with caution.
+    Trigger re-translation for a Core.
+    lang: specific language code (e.g. 'hi') or omit for all configured languages.
+    mode=machine_generated_only: preserves EXPERT_VALIDATED translations (safe default).
+    mode=all: overwrites everything including EXPERT_VALIDATED — requires confirmation.
     """
     await get_core(db, core_id)
 
     if mode not in ("machine_generated_only", "all"):
         raise HTTPException(status_code=422, detail="mode must be 'machine_generated_only' or 'all'")
 
-    lang_configs = (await db.execute(
-        select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
-    )).scalars().all()
+    if lang:
+        lang_config = (await db.execute(
+            select(CoreLanguageConfig).where(
+                CoreLanguageConfig.core_id == core_id,
+                CoreLanguageConfig.language_code == lang,
+            )
+        )).scalar_one_or_none()
+        if not lang_config:
+            raise HTTPException(status_code=404, detail=f"Language '{lang}' not configured for this Core")
+        target_langs = [lang]
+    else:
+        lang_configs = (await db.execute(
+            select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id)
+        )).scalars().all()
+        if not lang_configs:
+            raise HTTPException(status_code=422, detail="No languages configured for this Core")
+        target_langs = [c.language_code for c in lang_configs]
 
-    if not lang_configs:
-        raise HTTPException(status_code=422, detail="No languages configured for this Core")
-
-    target_langs = [c.language_code for c in lang_configs]
     overwrite_expert = (mode == "all")
 
     from app.tasks.translation import retranslate_core as retranslate_task
     retranslate_task.delay(core_id, target_langs, overwrite_expert)
 
     return {
-        "message": f"Re-translation queued for {len(target_langs)} languages",
+        "message": f"Re-translation queued for {len(target_langs)} language(s)",
         "mode": mode,
         "languages": target_langs,
     }
+
+
+@router.put("/{core_id}/items/{item_id}/translations/{lang_code}", response_model=CoreDataItemOut)
+async def update_single_translation(
+    core_id: str,
+    item_id: str,
+    lang_code: str,
+    translated_value: str = Query(..., description="Corrected translation value"),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """
+    Inline-edit a single translation for one item.
+    Always marks it EXPERT_VALIDATED — use for direct corrections without CSV round-trip.
+    """
+    from app.models.models import CoreDataTranslation, ValidationStatus
+    from datetime import datetime, timezone
+
+    await get_core(db, core_id, current_user)
+    item = await get_item(db, item_id)
+    if item.core_id != core_id:
+        raise HTTPException(status_code=404, detail="Item not found in this Core")
+
+    lang_config = (await db.execute(
+        select(CoreLanguageConfig).where(
+            CoreLanguageConfig.core_id == core_id,
+            CoreLanguageConfig.language_code == lang_code,
+        )
+    )).scalar_one_or_none()
+    if not lang_config:
+        raise HTTPException(status_code=404, detail=f"Language '{lang_code}' not configured for this Core")
+
+    now = datetime.now(timezone.utc)
+    existing = (await db.execute(
+        select(CoreDataTranslation).where(
+            CoreDataTranslation.item_id == item_id,
+            CoreDataTranslation.language_code == lang_code,
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        existing.translated_value = translated_value.strip()
+        existing.validation_status = ValidationStatus.EXPERT_VALIDATED
+        existing.validated_by = current_user.id
+        existing.validated_at = now
+    else:
+        db.add(CoreDataTranslation(
+            item_id=item_id,
+            language_code=lang_code,
+            translated_value=translated_value.strip(),
+            validation_status=ValidationStatus.EXPERT_VALIDATED,
+            validated_by=current_user.id,
+            validated_at=now,
+        ))
+
+    await db.commit()
+    result = await db.execute(
+        select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.id == item_id)
+    )
+    return result.scalar_one()
 
 
 # ── CSV Export (BL-C-08 step 1) ────────────────────────────────────────────────
