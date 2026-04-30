@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
+from typing import List
 from app.database import get_db
 from app.dependencies import require_role
 from app.services.auth_service import get_user_by_email
@@ -11,6 +12,59 @@ from app.models.models import User, UserRoleModel, UserRole, StatusEnum, Core, C
 router = APIRouter(prefix="/admin/users", tags=["Admin — Users"])
 
 require_admin = require_role(UserRole.ADMIN)
+
+# ── Singleton roles: only one active user may hold each of these ───────────
+_SINGLETON_ROLES = {UserRole.ADMIN, UserRole.DESIGNER, UserRole.REVIEWER}
+
+
+async def _validate_roles(db: AsyncSession, roles: List[UserRole], exclude_user_id: str = None):
+    """
+    Enforce role constraints:
+      - ADMIN is exclusive (no other roles allowed)
+      - DESIGNER + REVIEWER is the only permitted two-role combo for Designer
+      - STOCKER + REVIEWER is the only permitted two-role combo for Stocker
+      - ADMIN, DESIGNER, and REVIEWER are each limited to one active holder
+    """
+    role_set = set(roles)
+
+    if not role_set:
+        raise HTTPException(status_code=400, detail="At least one role must be assigned")
+
+    # ADMIN cannot be combined with anything
+    if UserRole.ADMIN in role_set and len(role_set) > 1:
+        raise HTTPException(status_code=400, detail="Admin cannot have any other role assigned")
+
+    # DESIGNER and STOCKER cannot be combined
+    if UserRole.DESIGNER in role_set and UserRole.STOCKER in role_set:
+        raise HTTPException(status_code=400, detail="Designer and Stocker roles cannot be combined")
+
+    # REVIEWER cannot be combined with ADMIN (already caught above, belt-and-suspenders)
+    if UserRole.REVIEWER in role_set and UserRole.ADMIN in role_set:
+        raise HTTPException(status_code=400, detail="Admin cannot have any other role assigned")
+
+    # Check singleton limits (only one active holder per singleton role)
+    for role in _SINGLETON_ROLES:
+        if role not in role_set:
+            continue
+        q = (
+            select(func.count())
+            .select_from(UserRoleModel)
+            .join(User, User.id == UserRoleModel.user_id)
+            .where(
+                UserRoleModel.role == role,
+                UserRoleModel.status == StatusEnum.ACTIVE,
+                User.status == StatusEnum.ACTIVE,
+            )
+        )
+        if exclude_user_id:
+            q = q.where(UserRoleModel.user_id != exclude_user_id)
+        count = (await db.execute(q)).scalar()
+        if count > 0:
+            label = role.value.capitalize()
+            raise HTTPException(
+                status_code=400,
+                detail=f"A {label} already exists. Only one {label} is allowed in Cosh.",
+            )
 
 
 @router.get("", response_model=list[UserOut])
@@ -33,6 +87,8 @@ async def create_user(
     existing = await get_user_by_email(db, request.email)
     if existing:
         raise HTTPException(status_code=409, detail="A user with this email already exists")
+
+    await _validate_roles(db, request.roles)
 
     user = User(
         email=request.email,
@@ -87,6 +143,8 @@ async def update_user_roles(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    await _validate_roles(db, request.roles, exclude_user_id=user_id)
 
     existing_roles = await db.execute(
         select(UserRoleModel).where(UserRoleModel.user_id == user_id)
