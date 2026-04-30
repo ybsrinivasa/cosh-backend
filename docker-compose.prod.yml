@@ -109,6 +109,9 @@ services:
         # Read from .env — use http://IP/api initially, change to https://domain/api after DNS+SSL
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
     restart: unless-stopped
+    environment:
+      # Server-side API URL (Next.js → API container via Docker network)
+      INTERNAL_API_URL: http://api:8000
     ports:
       - "127.0.0.1:3001:3000"   # 3000 may be occupied; nginx proxies host:3001 → container:3000
     healthcheck:
