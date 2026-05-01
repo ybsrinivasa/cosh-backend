@@ -59,11 +59,11 @@ class ConnectDataPositionIn(BaseModel):
 
 
 class ConnectDataPositionOut(BaseModel):
-    id: str
-    connect_data_item_id: str
     position_number: int
     core_data_item_id: Optional[str] = None
     connect_data_item_ref_id: Optional[str] = None
+    display_value: Optional[str] = None
+    item_status: Optional[str] = None
 
     class Config:
         from_attributes = True
