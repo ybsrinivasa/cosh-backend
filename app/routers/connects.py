@@ -370,6 +370,33 @@ async def list_connect_data_items(
         )).all()
         user_map = {u.id: u.name or u.email for u in users}
 
+    # Resolve core_data_item_ids to display names — no status filter so inactive items still resolve
+    all_cdi_ids = {
+        pos.core_data_item_id
+        for item in items
+        for pos in item.positions
+        if pos.core_data_item_id
+    }
+    cdi_name_map: dict = {}
+    if all_cdi_ids:
+        rows = (await db.execute(
+            select(CoreDataItem.id, CoreDataItem.english_value, CoreDataItem.status)
+            .where(CoreDataItem.id.in_(all_cdi_ids))
+        )).all()
+        cdi_name_map = {r.id: {"name": r.english_value, "status": r.status.value} for r in rows}
+
+    def _enrich_position(pos):
+        enriched = {
+            "position_number": pos.position_number,
+            "core_data_item_id": pos.core_data_item_id,
+            "connect_data_item_ref_id": pos.connect_data_item_ref_id,
+        }
+        if pos.core_data_item_id:
+            info = cdi_name_map.get(pos.core_data_item_id, {})
+            enriched["display_value"] = info.get("name", pos.core_data_item_id)
+            enriched["item_status"] = info.get("status", "UNKNOWN")
+        return enriched
+
     return [
         {
             "id": item.id,
@@ -377,7 +404,7 @@ async def list_connect_data_items(
             "status": item.status,
             "created_by_name": item.legacy_created_by_name or user_map.get(item.created_by),
             "created_at": item.created_at,
-            "positions": item.positions,
+            "positions": [_enrich_position(p) for p in item.positions],
         }
         for item in items
     ]

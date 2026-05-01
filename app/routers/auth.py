@@ -28,8 +28,10 @@ async def request_otp(request: OtpRequestSchema, db: AsyncSession = Depends(get_
     """Step 1 of OTP login: send a 6-digit code to the user's email."""
     user = await get_user_by_email(db, request.email)
     if not user:
-        # Return 200 regardless — don't reveal whether the email exists
-        return {"detail": "If that email is registered, a code has been sent."}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This email is not registered in Cosh. Please contact your administrator.",
+        )
 
     # Delete any unexpired OTPs for this user
     await db.execute(delete(LoginOTP).where(LoginOTP.user_id == user.id))
