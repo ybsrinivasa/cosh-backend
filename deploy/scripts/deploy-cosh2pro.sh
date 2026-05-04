@@ -26,6 +26,29 @@ if ! grep -q "^SECRET_KEY=" .env || grep -q "CHANGE_ME" .env; then
     exit 1
 fi
 
+# Ensure POSTGRES_PASSWORD value appears inside DATABASE_URL and DATABASE_URL_SYNC.
+# (One morning we lost an hour because postgres was init'd with one password and
+# the app's connection string had another. Catch this BEFORE postgres starts.)
+PG_PWD=$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2-)
+if [ -z "$PG_PWD" ]; then
+    echo "ERROR: POSTGRES_PASSWORD is empty in .env"
+    exit 1
+fi
+for var in DATABASE_URL DATABASE_URL_SYNC; do
+    URL=$(grep "^${var}=" .env | cut -d= -f2-)
+    if [ -z "$URL" ]; then
+        echo "ERROR: ${var} not set in .env"
+        exit 1
+    fi
+    # The URL must contain :PASSWORD@ to authenticate as the cosh user
+    if ! echo "$URL" | grep -qF ":${PG_PWD}@"; then
+        echo "ERROR: ${var} does not contain POSTGRES_PASSWORD."
+        echo "       All three values must use the same password:"
+        echo "       POSTGRES_PASSWORD, DATABASE_URL, DATABASE_URL_SYNC"
+        exit 1
+    fi
+done
+
 # ── 2. Pull latest code ──────────────────────────────────────────────────────
 echo ">> Pulling latest backend..."
 git -C "$BACKEND_DIR" pull origin main
