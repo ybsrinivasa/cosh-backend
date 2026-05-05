@@ -23,7 +23,8 @@ from app.services.core_service import (
     dual_write_create, dual_write_update_english, inactivity_cascade
 )
 from app.services.sync_service import write_sync_changes
-from app.models.models import EntityType, ChangeType
+from app.models.models import EntityType, ChangeType, new_uuid, utcnow as _utcnow_fn
+from app.neo4j_db import driver as _neo_driver
 
 router = APIRouter(prefix="/cores", tags=["Cores"])
 
@@ -557,8 +558,38 @@ async def upload_csv(
                 continue
         return None
 
+    # Pre-fetch existing items for this core into a dict (one query instead of N).
+    existing_items_q = await db.execute(
+        select(CoreDataItem).where(CoreDataItem.core_id == core_id)
+    )
+    existing_items_list = existing_items_q.scalars().all()
+    existing_by_name: dict[str, CoreDataItem] = {}
+    for it in existing_items_list:
+        existing_by_name.setdefault(it.english_value.lower(), it)
+    existing_item_ids = [it.id for it in existing_items_list]
+
+    existing_media_by_item: dict[str, MediaItem] = {}
+    if is_media and existing_item_ids:
+        media_q = await db.execute(
+            select(MediaItem).where(MediaItem.item_id.in_(existing_item_ids))
+        )
+        for m in media_q.scalars().all():
+            existing_media_by_item.setdefault(m.item_id, m)
+
+    existing_trans_by_key: dict[tuple[str, str], CoreDataTranslation] = {}
+    if (not is_media) and existing_item_ids and lang_cols:
+        trans_q = await db.execute(
+            select(CoreDataTranslation).where(
+                CoreDataTranslation.item_id.in_(existing_item_ids),
+                CoreDataTranslation.language_code.in_(list(lang_cols.keys())),
+            )
+        )
+        for t in trans_q.scalars().all():
+            existing_trans_by_key[(t.item_id, t.language_code)] = t
+
+    new_items: list[CoreDataItem] = []  # buffered for batched Neo4J create
+
     for i, row in enumerate(rows, start=2):
-        # Support both TEXT and MEDIA name columns
         english_value = (
             row.get("english_value") or row.get("English_value") or
             row.get("English_name") or row.get("english_name") or ""
@@ -567,7 +598,6 @@ async def upload_csv(
             errors.append(f"Row {i}: empty name — skipped")
             continue
 
-        # MEDIA: require a URL column
         s3_url = None
         if is_media:
             s3_url = (
@@ -578,14 +608,6 @@ async def upload_csv(
                 errors.append(f"Row {i}: '{english_value}' — missing English_url, skipped")
                 continue
 
-        existing = (await db.execute(
-            select(CoreDataItem).where(
-                CoreDataItem.core_id == core_id,
-                CoreDataItem.english_value.ilike(english_value)
-            )
-        )).scalars().first()
-
-        # Read legacy creator and timestamp from CSV if present
         csv_created_by_name = (
             row.get("Created By") or row.get("created_by") or
             row.get("Created by") or ""
@@ -595,48 +617,47 @@ async def upload_csv(
             row.get("Created At") or ""
         )
 
+        key = english_value.lower()
+        existing = existing_by_name.get(key)
+
         if existing:
             skipped += 1
             item = existing
-            # For MEDIA: update URL if changed
             if is_media and s3_url:
-                existing_media = (await db.execute(
-                    select(MediaItem).where(MediaItem.item_id == existing.id)
-                )).scalars().first()
+                existing_media = existing_media_by_item.get(existing.id)
                 if existing_media and existing_media.s3_url != s3_url:
                     existing_media.s3_url = s3_url
                 elif not existing_media:
-                    db.add(MediaItem(item_id=existing.id, s3_url=s3_url,
-                                     content_type=core.content_type or ContentType.IMAGE))
+                    new_media = MediaItem(item_id=existing.id, s3_url=s3_url,
+                                          content_type=core.content_type or ContentType.IMAGE)
+                    db.add(new_media)
+                    existing_media_by_item[existing.id] = new_media
         else:
+            new_id = new_uuid()
             item = CoreDataItem(
+                id=new_id,
                 core_id=core_id,
                 english_value=english_value,
                 legacy_item_id=row.get("id") or row.get("legacy_id") or None,
                 status=StatusEnum.ACTIVE,
                 created_by=current_user.id,
                 legacy_created_by_name=csv_created_by_name,
-                created_at=csv_created_at or utcnow(),
+                created_at=csv_created_at or _utcnow_fn(),
             )
             db.add(item)
-            await db.flush()
+            new_items.append(item)
+            existing_by_name[key] = item
+            created += 1
 
             if is_media and s3_url:
-                db.add(MediaItem(item_id=item.id, s3_url=s3_url,
-                                 content_type=core.content_type or ContentType.IMAGE))
-
-            try:
-                await dual_write_create(db, item)
-                created += 1
-            except Exception as e:
-                await db.rollback()
-                errors.append(f"Row {i}: Neo4J write failed — {str(e)}")
-                continue
+                new_media = MediaItem(item_id=new_id, s3_url=s3_url,
+                                      content_type=core.content_type or ContentType.IMAGE)
+                db.add(new_media)
+                existing_media_by_item[new_id] = new_media
 
         if is_media:
-            continue  # No language translations for MEDIA cores
+            continue
 
-        # Import language translations from CSV columns (TEXT cores only — P7-02)
         for lang, (val_col, status_col) in lang_cols.items():
             translated_value = (row.get(val_col) or "").strip()
             if not translated_value:
@@ -646,26 +667,43 @@ async def upload_csv(
             is_expert = raw_status in ("EXPERT_VALIDATED", "TRUE", "1", "YES", "VALIDATED")
             validation_status = ValidationStatus.EXPERT_VALIDATED if is_expert else ValidationStatus.MACHINE_GENERATED
 
-            existing_trans = (await db.execute(
-                select(CoreDataTranslation).where(
-                    CoreDataTranslation.item_id == item.id,
-                    CoreDataTranslation.language_code == lang,
-                )
-            )).scalars().first()
-
+            existing_trans = existing_trans_by_key.get((item.id, lang))
             if existing_trans:
                 if existing_trans.validation_status == ValidationStatus.EXPERT_VALIDATED and not is_expert:
                     continue
                 existing_trans.translated_value = translated_value
                 existing_trans.validation_status = validation_status
             else:
-                db.add(CoreDataTranslation(
+                new_trans = CoreDataTranslation(
                     item_id=item.id,
                     language_code=lang,
                     translated_value=translated_value,
                     validation_status=validation_status,
-                ))
+                )
+                db.add(new_trans)
+                existing_trans_by_key[(item.id, lang)] = new_trans
             translations_imported += 1
+
+    # Batched Neo4J create — one round trip for all new items.
+    if new_items:
+        try:
+            with _neo_driver.session() as neo_session:
+                neo_session.run(
+                    """
+                    UNWIND $items AS row
+                    CREATE (:CoreDataItem {
+                        id: row.id,
+                        core_id: row.core_id,
+                        english_value: row.english_value,
+                        status: 'ACTIVE'
+                    })
+                    """,
+                    items=[{"id": it.id, "core_id": it.core_id, "english_value": it.english_value}
+                           for it in new_items],
+                )
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=500, detail=f"Neo4J batch create failed: {str(e)}")
 
     await db.commit()
 
