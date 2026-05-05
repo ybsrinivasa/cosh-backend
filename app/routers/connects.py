@@ -792,7 +792,7 @@ async def upload_excel(
                 row_failed = True
                 continue
 
-            value = value.lstrip("ID_").rstrip("|")
+            value = value.removeprefix("ID_").removesuffix("|")
             node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
 
             if node_type == 'CORE':
