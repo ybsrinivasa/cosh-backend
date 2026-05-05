@@ -583,7 +583,7 @@ async def upload_csv(
                 CoreDataItem.core_id == core_id,
                 CoreDataItem.english_value.ilike(english_value)
             )
-        )).scalar_one_or_none()
+        )).scalars().first()
 
         # Read legacy creator and timestamp from CSV if present
         csv_created_by_name = (
@@ -602,7 +602,7 @@ async def upload_csv(
             if is_media and s3_url:
                 existing_media = (await db.execute(
                     select(MediaItem).where(MediaItem.item_id == existing.id)
-                )).scalar_one_or_none()
+                )).scalars().first()
                 if existing_media and existing_media.s3_url != s3_url:
                     existing_media.s3_url = s3_url
                 elif not existing_media:
@@ -651,7 +651,7 @@ async def upload_csv(
                     CoreDataTranslation.item_id == item.id,
                     CoreDataTranslation.language_code == lang,
                 )
-            )).scalar_one_or_none()
+            )).scalars().first()
 
             if existing_trans:
                 if existing_trans.validation_status == ValidationStatus.EXPERT_VALIDATED and not is_expert:
