@@ -681,11 +681,6 @@ async def upload_excel(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(require_designer_or_stocker),
 ):
-    try:
-        import openpyxl
-    except ImportError:
-        raise HTTPException(status_code=500, detail="openpyxl is required for Excel upload. Run: pip install openpyxl")
-
     connect = await get_connect(db, connect_id, current_user)
     check_stocker_exclusive_write(connect.assigned_stocker_id, current_user)
 
@@ -700,12 +695,25 @@ async def upload_excel(
         raise HTTPException(status_code=422, detail="Define the Connect schema before uploading data")
 
     content = await file.read()
-    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
+    filename = (file.filename or "").lower()
+    is_csv = filename.endswith(".csv")
+
+    if is_csv:
+        import csv as _csv
+        text = content.decode("utf-8-sig", errors="replace")
+        reader = _csv.reader(io.StringIO(text))
+        rows = list(reader)
+    else:
+        try:
+            import openpyxl
+        except ImportError:
+            raise HTTPException(status_code=500, detail="openpyxl is required for Excel upload. Run: pip install openpyxl")
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
 
     if not rows:
-        raise HTTPException(status_code=422, detail="Excel file is empty")
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
 
     headers = [str(h).strip() if h else "" for h in rows[0]]
     data_rows = rows[1:]
