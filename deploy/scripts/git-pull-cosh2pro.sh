@@ -19,7 +19,7 @@ BACKEND_DIR=/data/cosh2.0Pro/cosh-backend
 FRONTEND_DIR=/data/cosh2.0Pro/cosh-frontend
 
 # Production branches (change here if you switch branches in future)
-BACKEND_BRANCH=prod-cosh2pro-setup
+BACKEND_BRANCH=main
 FRONTEND_BRANCH=main
 
 LOG_DIR=/data/cosh2.0Pro/backups
