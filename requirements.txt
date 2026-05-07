@@ -19,3 +19,4 @@ redis==5.2.1
 boto3==1.38.3
 openpyxl==3.1.5
 requests==2.32.3
+httpx==0.28.1
