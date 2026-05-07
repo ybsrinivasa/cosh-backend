@@ -74,6 +74,24 @@ services:
       timeout: 10s
       retries: 3
 
+  # ── IndicTrans2 (background translation) ───────────────────────────────────
+  indictrans:
+    build:
+      context: ./indictrans
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8001"
+    volumes:
+      # Persist HuggingFace model cache so we don't re-download on rebuild.
+      - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+
   # ── Celery worker ───────────────────────────────────────────────────────────
   celery:
     build:

@@ -1,0 +1,6 @@
+transformers>=4.45,<5
+sentencepiece>=0.2.0
+IndicTransToolkit>=1.0.3
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
