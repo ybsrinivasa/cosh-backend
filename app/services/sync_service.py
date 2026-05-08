@@ -8,9 +8,9 @@ from sqlalchemy import select, func, update
 from fastapi import HTTPException
 from app.models.models import (
     SyncChangeLog, SyncHistory, ProductSyncState, ProductRegistry,
-    CoreProductTag, ConnectProductTag, Core, Connect,
+    CoreProductTag, ConnectProductTag, Core, Connect, CoreType,
     CoreDataItem, CoreDataTranslation, ConnectDataItem, ConnectDataPosition,
-    ConnectSchemaPosition, RelationshipTypeRegistry,
+    ConnectSchemaPosition, RelationshipTypeRegistry, MediaItem,
     EntityType, ChangeType, SyncMode, SyncStatus, StatusEnum,
 )
 
@@ -320,6 +320,19 @@ async def build_payload(
         if not items:
             continue
 
+        # MEDIA cores: batch-fetch MediaItem rows so we can emit s3_path/media_type
+        # in the per-item metadata. One query per Core, not per item.
+        core_obj = (await db.execute(select(Core).where(Core.id == core_id))).scalar_one_or_none()
+        is_media_core = core_obj is not None and core_obj.core_type == CoreType.MEDIA
+        media_by_item: dict[str, MediaItem] = {}
+        if is_media_core:
+            item_ids = [i.id for i in items]
+            media_rows = (await db.execute(
+                select(MediaItem).where(MediaItem.item_id.in_(item_ids))
+            )).scalars().all()
+            for m in media_rows:
+                media_by_item[m.item_id] = m
+
         if entity_type_label not in batches:
             batches[entity_type_label] = {"entity_type": entity_type_label, "items": []}
 
@@ -331,11 +344,22 @@ async def build_payload(
             for t in trans_rows:
                 translations[t.language_code] = t.translated_value
 
+            metadata: dict = {}
+            m = media_by_item.get(item.id)
+            if m:
+                if m.s3_url:
+                    metadata["s3_path"] = m.s3_url
+                if m.content_type:
+                    ct_val = m.content_type.value if hasattr(m.content_type, "value") else str(m.content_type)
+                    metadata["media_type"] = ct_val.lower()
+
             batches[entity_type_label]["items"].append({
                 "cosh_id": item.id,
                 "entity_type": entity_type_label,
                 "status": "active" if item.status == StatusEnum.ACTIVE else "inactive",
                 "translations": translations,
+                "parent_cosh_id": None,
+                "metadata": metadata,
             })
 
     # ── Connect entity batches ─────────────────────────────────────────────────
@@ -433,7 +457,7 @@ async def build_payload(
         "cosh_payload_version": "2.0",
         "sync_id": sync_id,
         "product": product.name,
-        "sync_mode": sync_mode.value,
+        "sync_mode": sync_mode.value.lower(),
         "initiated_at": datetime.now(timezone.utc).isoformat(),
         "initiated_by": initiated_by,
         "entity_batches": sorted_batches,
