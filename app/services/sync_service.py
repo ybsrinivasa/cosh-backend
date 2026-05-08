@@ -285,6 +285,86 @@ async def build_payload(
     rel_type_rows = (await db.execute(select(RelationshipTypeRegistry))).scalars().all()
     rel_display_map = {r.label: r.display_name for r in rel_type_rows}
 
+    # ── Scalar-attribute suppliers (Option A flattening for the sync contract) ─
+    # In Cosh, row-level "scalar" attributes (e.g. priority_rank on a
+    # pest_diagnosis_chain row) are modelled as a Core + a 2-position Connect
+    # of shape [pos 1: CONNECT (anchor), pos 2: CORE (the scalar's value)].
+    # The wire contract wants those values as flat ints on the anchor row.
+    # Here we discover such supplier Connects by schema shape, walk their
+    # rows once, and stash a {anchor_cdi_id: {scalar_name: int}} map.
+    # The supplier Connect itself is suppressed from the output batches.
+    KNOWN_SCALAR_ATTRS = {"priority_rank"}
+    scalar_attrs_by_parent: dict[str, dict] = {}
+    supplier_connect_ids: set[str] = set()
+
+    for cid in connect_ids:
+        sps = (await db.execute(
+            select(ConnectSchemaPosition)
+            .where(ConnectSchemaPosition.connect_id == cid)
+            .order_by(ConnectSchemaPosition.position_number)
+        )).scalars().all()
+        if len(sps) != 2:
+            continue
+        p1, p2 = sps[0], sps[1]
+        p1_node = p1.node_type.value if hasattr(p1.node_type, "value") else str(p1.node_type)
+        p2_node = p2.node_type.value if hasattr(p2.node_type, "value") else str(p2.node_type)
+        if p1_node != "CONNECT" or p2_node != "CORE":
+            continue
+        scalar_name = core_label_map.get(p2.core_id)
+        if scalar_name not in KNOWN_SCALAR_ATTRS:
+            continue
+
+        supplier_connect_ids.add(cid)
+        supplier_cdis = (await db.execute(
+            select(ConnectDataItem).where(
+                ConnectDataItem.connect_id == cid,
+                ConnectDataItem.status == StatusEnum.ACTIVE,
+            )
+        )).scalars().all()
+        if not supplier_cdis:
+            continue
+
+        supplier_positions = (await db.execute(
+            select(ConnectDataPosition).where(
+                ConnectDataPosition.connect_data_item_id.in_([s.id for s in supplier_cdis])
+            )
+        )).scalars().all()
+        positions_by_cdi: dict[str, list] = {}
+        for pos in supplier_positions:
+            positions_by_cdi.setdefault(pos.connect_data_item_id, []).append(pos)
+
+        scalar_core_item_ids = [
+            pos.core_data_item_id
+            for pos in supplier_positions
+            if pos.position_number == p2.position_number and pos.core_data_item_id
+        ]
+        scalar_value_map: dict[str, str] = {}
+        if scalar_core_item_ids:
+            scalar_value_rows = (await db.execute(
+                select(CoreDataItem.id, CoreDataItem.english_value)
+                .where(CoreDataItem.id.in_(scalar_core_item_ids))
+            )).all()
+            scalar_value_map = {r.id: r.english_value for r in scalar_value_rows}
+
+        for sc in supplier_cdis:
+            row_positions = positions_by_cdi.get(sc.id, [])
+            anchor = next((p for p in row_positions if p.position_number == p1.position_number), None)
+            scalar = next((p for p in row_positions if p.position_number == p2.position_number), None)
+            if not anchor or not scalar:
+                continue
+            anchor_cdi_id = anchor.connect_data_item_ref_id
+            scalar_core_id = scalar.core_data_item_id
+            if not anchor_cdi_id or not scalar_core_id:
+                continue
+            raw = scalar_value_map.get(scalar_core_id)
+            if raw is None:
+                continue
+            try:
+                value = int(str(raw).strip())
+            except ValueError:
+                continue
+            scalar_attrs_by_parent.setdefault(anchor_cdi_id, {})[scalar_name] = value
+
     # ── Changed IDs for incremental mode ──────────────────────────────────────
     changed_core_item_ids: set = set()
     changed_connect_item_ids: set = set()
@@ -306,6 +386,8 @@ async def build_payload(
     # ── Core entity batches ────────────────────────────────────────────────────
     for core_id in core_ids:
         entity_type_label = core_label_map.get(core_id) or f"core_{core_id[:8]}"
+        if entity_type_label in KNOWN_SCALAR_ATTRS:
+            continue  # value-source Core; its values are inlined onto anchor items
 
         items_q = select(CoreDataItem).where(CoreDataItem.core_id == core_id)
         if sync_mode == SyncMode.INCREMENTAL:
@@ -364,6 +446,8 @@ async def build_payload(
 
     # ── Connect entity batches ─────────────────────────────────────────────────
     for connect_id in connect_ids:
+        if connect_id in supplier_connect_ids:
+            continue  # data already flattened onto its anchor's items
         entity_type_label = connect_label_map.get(connect_id) or f"connect_{connect_id[:8]}"
 
         connect_obj = (await db.execute(
@@ -437,12 +521,15 @@ async def build_payload(
                                                             f"position_{p.position_number}"),
                 }
 
-            batches[entity_type_label]["items"].append({
+            connect_item: dict = {
                 "cosh_id": cdi.id,
                 "entity_type": entity_type_label,
                 "status": "active" if cdi.status == StatusEnum.ACTIVE else "inactive",
                 "positions": positions_out,
-            })
+            }
+            if cdi.id in scalar_attrs_by_parent:
+                connect_item.update(scalar_attrs_by_parent[cdi.id])
+            batches[entity_type_label]["items"].append(connect_item)
 
     # ── Sort by dependency order and return ───────────────────────────────────
     def _sort_key(label: str) -> int:
