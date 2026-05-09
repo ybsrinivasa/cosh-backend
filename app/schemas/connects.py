@@ -21,6 +21,7 @@ class SchemaPositionIn(BaseModel):
     core_id: Optional[str] = None
     connect_ref_id: Optional[str] = None
     relationship_type_to_next: Optional[str] = None
+    position_label: Optional[str] = None
 
 
 class SchemaPositionOut(BaseModel):
@@ -33,6 +34,7 @@ class SchemaPositionOut(BaseModel):
     connect_ref_id: Optional[str] = None
     connect_ref_name: Optional[str] = None
     relationship_type_to_next: Optional[str]
+    position_label: Optional[str] = None
 
     class Config:
         from_attributes = True

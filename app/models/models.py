@@ -309,6 +309,7 @@ class ConnectSchemaPosition(Base):
     core_id: Mapped[str] = mapped_column(String(36), ForeignKey("cores.id"), nullable=True)
     connect_ref_id: Mapped[str] = mapped_column(String(36), ForeignKey("connects.id"), nullable=True)
     relationship_type_to_next: Mapped[str] = mapped_column(String(200), nullable=True)
+    position_label: Mapped[str] = mapped_column(String(200), nullable=True)
 
     connect: Mapped["Connect"] = relationship(
         "Connect", back_populates="schema_positions",

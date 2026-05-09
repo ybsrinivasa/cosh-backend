@@ -1,5 +1,7 @@
 import io
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
@@ -146,6 +148,7 @@ async def _enrich_schema_positions(db: AsyncSession, positions) -> list[SchemaPo
             connect_ref_id=p.connect_ref_id,
             connect_ref_name=connect_name_map.get(p.connect_ref_id) if p.connect_ref_id else None,
             relationship_type_to_next=p.relationship_type_to_next,
+            position_label=p.position_label,
         )
         for p in positions
     ]
@@ -228,6 +231,7 @@ async def define_schema(
         await db.delete(row)
 
     for pos in sorted_positions:
+        label = (pos.position_label or "").strip() or None
         schema_pos = ConnectSchemaPosition(
             connect_id=connect_id,
             position_number=pos.position_number,
@@ -235,6 +239,7 @@ async def define_schema(
             core_id=pos.core_id,
             connect_ref_id=pos.connect_ref_id,
             relationship_type_to_next=pos.relationship_type_to_next,
+            position_label=label,
         )
         db.add(schema_pos)
 
@@ -245,6 +250,39 @@ async def define_schema(
         .order_by(ConnectSchemaPosition.position_number)
     )
     return await _enrich_schema_positions(db, result.scalars().all())
+
+
+class _PositionLabelUpdate(BaseModel):
+    position_label: Optional[str] = None
+
+
+@router.put("/{connect_id}/schema/{position_id}/label", response_model=SchemaPositionOut)
+async def update_schema_position_label(
+    connect_id: str,
+    position_id: str,
+    request: _PositionLabelUpdate,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_designer),
+):
+    """Edit only a schema position's display label.
+    Allowed even when the schema is finalised — labels are presentational
+    (used to disambiguate duplicate-Core columns in the row builder and
+    CSV upload), they don't change the schema's semantic structure."""
+    await get_connect(db, connect_id)
+    pos = (await db.execute(
+        select(ConnectSchemaPosition).where(
+            ConnectSchemaPosition.id == position_id,
+            ConnectSchemaPosition.connect_id == connect_id,
+        )
+    )).scalar_one_or_none()
+    if not pos:
+        raise HTTPException(status_code=404, detail="Schema position not found")
+
+    pos.position_label = (request.position_label or "").strip() or None
+    await db.commit()
+
+    enriched = await _enrich_schema_positions(db, [pos])
+    return enriched[0]
 
 
 # ── Connect Product Tags ───────────────────────────────────────────────────────
@@ -718,18 +756,31 @@ async def upload_excel(
     headers = [str(h).strip() if h else "" for h in rows[0]]
     data_rows = rows[1:]
 
-    # Build column names per position (Core name or Connect name)
-    position_names = []
+    # Build column names per position. Position-label wins; otherwise the Core
+    # (or Connect) name. When the same fallback name appears multiple times in
+    # one schema, both labels and the upload resolution treat the second/third
+    # occurrence as "Name (2)", "Name (3)" — keeps duplicate-Core schemas
+    # disambiguated even without an explicit position_label.
+    raw_names: list[str] = []
     for sp in schema_positions:
         node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
-        if node_type == 'CORE' and sp.core_id:
+        if sp.position_label and sp.position_label.strip():
+            raw_names.append(sp.position_label.strip())
+        elif node_type == 'CORE' and sp.core_id:
             core = (await db.execute(select(Core).where(Core.id == sp.core_id))).scalar_one_or_none()
-            position_names.append(core.name if core else sp.core_id)
+            raw_names.append(core.name if core else sp.core_id)
         elif sp.connect_ref_id:
             ref_connect = (await db.execute(select(Connect).where(Connect.id == sp.connect_ref_id))).scalar_one_or_none()
-            position_names.append(ref_connect.name if ref_connect else sp.connect_ref_id)
+            raw_names.append(ref_connect.name if ref_connect else sp.connect_ref_id)
         else:
-            position_names.append(f"Position {sp.position_number}")
+            raw_names.append(f"Position {sp.position_number}")
+
+    seen: dict[str, int] = {}
+    position_names: list[str] = []
+    for name in raw_names:
+        n = seen.get(name, 0)
+        seen[name] = n + 1
+        position_names.append(name if n == 0 else f"{name} ({n + 1})")
 
     resolved_count = 0
     unresolved_count = 0
