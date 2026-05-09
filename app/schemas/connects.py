@@ -107,3 +107,40 @@ class ExcelUploadReport(BaseModel):
     unresolved: int
     skipped_duplicates: int = 0
     unresolved_details: List[dict]
+
+
+class DuplicatePositionValue(BaseModel):
+    position_number: int
+    label: str
+    value: str
+
+
+class DuplicateRow(BaseModel):
+    cdi_id: str
+    created_at: Optional[str] = None
+    legacy_created_by_name: Optional[str] = None
+    position_values: List[DuplicatePositionValue]
+
+
+class DuplicateGroup(BaseModel):
+    fingerprint: str
+    count: int
+    rows: List[DuplicateRow]
+
+
+class DuplicatesResponse(BaseModel):
+    total_groups: int
+    total_extra_items: int
+    skip: int
+    limit: int
+    groups: List[DuplicateGroup]
+
+
+class DuplicateCleanupRequest(BaseModel):
+    fingerprint: Optional[str] = None
+    all: bool = False
+
+
+class DuplicateCleanupResponse(BaseModel):
+    groups_processed: int
+    items_inactivated: int

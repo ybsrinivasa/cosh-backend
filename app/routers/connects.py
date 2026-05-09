@@ -16,7 +16,9 @@ from app.models.models import (
 from app.schemas.connects import (
     ConnectCreate, ConnectUpdate, ConnectOut, SchemaPositionIn, SchemaPositionOut,
     ConnectDataPositionIn, ConnectDataItemOut, ConnectProductTagOut,
-    ConnectStatusUpdate, ConnectDataStatusUpdate, ExcelUploadReport
+    ConnectStatusUpdate, ConnectDataStatusUpdate, ExcelUploadReport,
+    DuplicatesResponse, DuplicateGroup, DuplicateRow, DuplicatePositionValue,
+    DuplicateCleanupRequest, DuplicateCleanupResponse,
 )
 from app.services.connect_service import (
     get_connect, check_schema_uniqueness_with_connect_refs, validate_relationship_type,
@@ -990,4 +992,213 @@ async def upload_excel(
         unresolved=unresolved_count,
         skipped_duplicates=skipped_duplicates,
         unresolved_details=unresolved_details,
+    )
+
+
+# ── Duplicate detection & cleanup ─────────────────────────────────────────────
+# Identifies ConnectDataItems that share the same position fingerprint
+# (the same set of (position_number, core_data_item_id) tuples). Created to
+# clean up the doubling caused by 504-then-retry uploads where the api process
+# kept committing in the background after nginx had given up.
+
+async def _build_position_labels(db: AsyncSession, schema_positions) -> dict[int, str]:
+    raw_names: list[tuple[int, str]] = []
+    for sp in schema_positions:
+        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+        if sp.position_label and sp.position_label.strip():
+            raw_names.append((sp.position_number, sp.position_label.strip()))
+        elif node_type == 'CORE' and sp.core_id:
+            core = (await db.execute(select(Core).where(Core.id == sp.core_id))).scalar_one_or_none()
+            raw_names.append((sp.position_number, core.name if core else f"Position {sp.position_number}"))
+        elif sp.connect_ref_id:
+            ref_connect = (await db.execute(select(Connect).where(Connect.id == sp.connect_ref_id))).scalar_one_or_none()
+            raw_names.append((sp.position_number, ref_connect.name if ref_connect else f"Position {sp.position_number}"))
+        else:
+            raw_names.append((sp.position_number, f"Position {sp.position_number}"))
+
+    seen: dict[str, int] = {}
+    out: dict[int, str] = {}
+    for pn, name in raw_names:
+        n = seen.get(name, 0)
+        seen[name] = n + 1
+        out[pn] = name if n == 0 else f"{name} ({n + 1})"
+    return out
+
+
+@router.get("/{connect_id}/duplicates", response_model=DuplicatesResponse)
+async def list_duplicates(
+    connect_id: str,
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """List groups of ACTIVE ConnectDataItems that share the same position
+    fingerprint. Within each group, rows are returned oldest-first so the UI
+    can mark the first as the keeper."""
+    await get_connect(db, connect_id, current_user)
+
+    items = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
+    )).scalars().all()
+
+    groups: dict[str, list[ConnectDataItem]] = {}
+    for item in items:
+        fp = _make_fingerprint(item.positions)
+        groups.setdefault(fp, []).append(item)
+
+    dup_groups = [(fp, members) for fp, members in groups.items() if len(members) > 1]
+    dup_groups.sort(key=lambda g: (-len(g[1]), min(m.created_at for m in g[1])))
+
+    total_groups = len(dup_groups)
+    total_extra = sum(len(members) - 1 for _, members in dup_groups)
+
+    page = dup_groups[skip:skip + limit]
+
+    core_item_ids: set[str] = set()
+    for _, members in page:
+        for m in members:
+            for pos in m.positions:
+                if pos.core_data_item_id:
+                    core_item_ids.add(pos.core_data_item_id)
+
+    core_items_map: dict[str, str] = {}
+    if core_item_ids:
+        rows_q = (await db.execute(
+            select(CoreDataItem.id, CoreDataItem.english_value)
+            .where(CoreDataItem.id.in_(list(core_item_ids)))
+        )).all()
+        core_items_map = {r.id: r.english_value for r in rows_q}
+
+    schema_positions = (await db.execute(
+        select(ConnectSchemaPosition)
+        .where(ConnectSchemaPosition.connect_id == connect_id)
+        .order_by(ConnectSchemaPosition.position_number)
+    )).scalars().all()
+    pos_labels = await _build_position_labels(db, schema_positions)
+
+    out_groups: list[DuplicateGroup] = []
+    for fp, members in page:
+        members_sorted = sorted(members, key=lambda m: m.created_at)
+        out_rows: list[DuplicateRow] = []
+        for m in members_sorted:
+            pvs: list[DuplicatePositionValue] = []
+            for pos in sorted(m.positions, key=lambda p: p.position_number):
+                if pos.core_data_item_id:
+                    value = core_items_map.get(pos.core_data_item_id, "—")
+                elif pos.connect_data_item_ref_id:
+                    value = f"[Connect ref] {pos.connect_data_item_ref_id[:8]}"
+                else:
+                    value = "—"
+                pvs.append(DuplicatePositionValue(
+                    position_number=pos.position_number,
+                    label=pos_labels.get(pos.position_number, f"Position {pos.position_number}"),
+                    value=value,
+                ))
+            out_rows.append(DuplicateRow(
+                cdi_id=m.id,
+                created_at=m.created_at.isoformat() if m.created_at else None,
+                legacy_created_by_name=m.legacy_created_by_name,
+                position_values=pvs,
+            ))
+        out_groups.append(DuplicateGroup(
+            fingerprint=fp,
+            count=len(members),
+            rows=out_rows,
+        ))
+
+    return DuplicatesResponse(
+        total_groups=total_groups,
+        total_extra_items=total_extra,
+        skip=skip,
+        limit=limit,
+        groups=out_groups,
+    )
+
+
+@router.post("/{connect_id}/duplicates/cleanup", response_model=DuplicateCleanupResponse)
+async def cleanup_duplicates(
+    connect_id: str,
+    body: DuplicateCleanupRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer),
+):
+    """Inactivate duplicate ConnectDataItems, keeping the oldest of each group.
+    Sets status to INACTIVE in Postgres, flips Neo4J relationships to INACTIVE,
+    and emits sync_change_log rows for each tagged product. No physical delete."""
+    await get_connect(db, connect_id, current_user)
+
+    if not body.fingerprint and not body.all:
+        raise HTTPException(status_code=422, detail="Provide fingerprint or set all=true")
+
+    items = (await db.execute(
+        select(ConnectDataItem)
+        .options(selectinload(ConnectDataItem.positions))
+        .where(ConnectDataItem.connect_id == connect_id, ConnectDataItem.status == StatusEnum.ACTIVE)
+    )).scalars().all()
+
+    groups: dict[str, list[ConnectDataItem]] = {}
+    for item in items:
+        fp = _make_fingerprint(item.positions)
+        groups.setdefault(fp, []).append(item)
+
+    if body.all:
+        target_groups = [g for g in groups.values() if len(g) > 1]
+    else:
+        if body.fingerprint not in groups:
+            raise HTTPException(status_code=404, detail="Fingerprint not found")
+        target_groups = [groups[body.fingerprint]]
+
+    ids_to_inactivate: list[str] = []
+    groups_processed = 0
+    for grp in target_groups:
+        if len(grp) <= 1:
+            continue
+        sorted_grp = sorted(grp, key=lambda m: m.created_at)
+        for member in sorted_grp[1:]:
+            ids_to_inactivate.append(member.id)
+        groups_processed += 1
+
+    if not ids_to_inactivate:
+        return DuplicateCleanupResponse(groups_processed=0, items_inactivated=0)
+
+    await db.execute(
+        update(ConnectDataItem)
+        .where(ConnectDataItem.id.in_(ids_to_inactivate))
+        .values(status=StatusEnum.INACTIVE)
+    )
+
+    try:
+        with _neo_driver.session() as neo:
+            neo.run(
+                """
+                UNWIND $ids AS id
+                MATCH ()-[r {connect_data_item_id: id}]-()
+                SET r.status = 'INACTIVE'
+                """,
+                ids=ids_to_inactivate,
+            )
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Neo4J batch inactivate failed: {str(e)}")
+
+    tagged_pids = (await db.execute(
+        select(ConnectProductTag.product_id).where(ConnectProductTag.connect_id == connect_id)
+    )).scalars().all()
+    for cdi_id in ids_to_inactivate:
+        for pid in tagged_pids:
+            db.add(SyncChangeLog(
+                product_id=pid,
+                entity_type=EntityType.CONNECT_DATA_ITEM,
+                entity_id=cdi_id,
+                change_type=ChangeType.INACTIVATED,
+            ))
+
+    await db.commit()
+
+    return DuplicateCleanupResponse(
+        groups_processed=groups_processed,
+        items_inactivated=len(ids_to_inactivate),
     )
