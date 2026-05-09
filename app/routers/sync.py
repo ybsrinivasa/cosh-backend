@@ -1,7 +1,7 @@
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from app.database import get_db
 from app.dependencies import require_role
 from app.models.models import (
@@ -182,7 +182,43 @@ async def set_entity_type_label(
     """
     Set the entity_type_label on a Core or Connect product tag.
     This label is used as the entity_type in the sync payload sent to RootsTalk.
+
+    Uniqueness: within a single product, the label must be unique across
+    BOTH Core and Connect tags. The wire payload uses the label as
+    `entity_type`, and consumers route by it — duplicates would silently
+    merge or overwrite batches at emit time. Empty/null labels are
+    exempt (an unset label means the tag falls back to a UUID-derived
+    placeholder, which only the source entity can produce).
     """
+    label_clean = (entity_type_label or "").strip()
+
+    if label_clean:
+        clash_core = (await db.execute(
+            select(CoreProductTag).where(
+                CoreProductTag.product_id == product_id,
+                CoreProductTag.core_id != entity_id,
+                func.lower(CoreProductTag.entity_type_label) == label_clean.lower(),
+            )
+        )).scalar_one_or_none()
+        if clash_core:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Slug '{label_clean}' is already used by another Core tagged to this product. Slugs must be unique across both Cores and Connects within a product.",
+            )
+
+        clash_connect = (await db.execute(
+            select(ConnectProductTag).where(
+                ConnectProductTag.product_id == product_id,
+                ConnectProductTag.connect_id != entity_id,
+                func.lower(ConnectProductTag.entity_type_label) == label_clean.lower(),
+            )
+        )).scalar_one_or_none()
+        if clash_connect:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Slug '{label_clean}' is already used by another Connect tagged to this product. Slugs must be unique across both Cores and Connects within a product.",
+            )
+
     core_tag = (await db.execute(
         select(CoreProductTag).where(
             CoreProductTag.core_id == entity_id,
@@ -191,9 +227,9 @@ async def set_entity_type_label(
     )).scalar_one_or_none()
 
     if core_tag:
-        core_tag.entity_type_label = entity_type_label
+        core_tag.entity_type_label = label_clean or None
         await db.commit()
-        return {"message": f"Core tag label set to '{entity_type_label}'"}
+        return {"message": f"Core tag label set to '{label_clean}'"}
 
     connect_tag = (await db.execute(
         select(ConnectProductTag).where(
@@ -203,8 +239,8 @@ async def set_entity_type_label(
     )).scalar_one_or_none()
 
     if connect_tag:
-        connect_tag.entity_type_label = entity_type_label
+        connect_tag.entity_type_label = label_clean or None
         await db.commit()
-        return {"message": f"Connect tag label set to '{entity_type_label}'"}
+        return {"message": f"Connect tag label set to '{label_clean}'"}
 
     raise HTTPException(status_code=404, detail="No product tag found for this entity and product")
