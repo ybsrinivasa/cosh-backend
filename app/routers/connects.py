@@ -1,4 +1,5 @@
 import io
+import uuid
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
@@ -10,7 +11,7 @@ from app.dependencies import require_role, is_stocker_only, check_stocker_exclus
 from app.models.models import (
     Connect, ConnectSchemaPosition, ConnectDataItem, ConnectDataPosition,
     ConnectProductTag, ProductRegistry, CoreDataItem, Core, User,
-    UserRole, StatusEnum, NodeType
+    UserRole, StatusEnum, NodeType, SyncChangeLog
 )
 from app.schemas.connects import (
     ConnectCreate, ConnectUpdate, ConnectOut, SchemaPositionIn, SchemaPositionOut,
@@ -23,6 +24,7 @@ from app.services.connect_service import (
 )
 from app.services.sync_service import write_sync_changes
 from app.models.models import EntityType, ChangeType
+from app.neo4j_db import driver as _neo_driver
 
 router = APIRouter(prefix="/connects", tags=["Connects"])
 
@@ -821,6 +823,33 @@ async def upload_excel(
     )).scalars().all()
     existing_fingerprints = {_make_fingerprint(item.positions) for item in existing_items}
 
+    # Pre-fetch every Core's items into a per-position lookup dict so the row loop
+    # never hits the database for resolution. With 4 positions × 7000 rows the
+    # naive path was 28k SELECTs and pushed past nginx's 504 timeout.
+    core_lookup_by_pos: dict[int, dict[str, str]] = {}
+    for sp in schema_positions:
+        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+        if node_type == 'CORE' and sp.core_id:
+            rows_q = (await db.execute(
+                select(CoreDataItem.id, CoreDataItem.english_value).where(
+                    CoreDataItem.core_id == sp.core_id,
+                    CoreDataItem.status == StatusEnum.ACTIVE,
+                )
+            )).all()
+            core_lookup_by_pos[sp.position_number] = {r.english_value: r.id for r in rows_q}
+
+    schema_map_by_pos = {sp.position_number: sp for sp in schema_positions}
+
+    # Tagged products: fetch once so we can buffer SyncChangeLog rows in-memory.
+    tagged_product_ids = (await db.execute(
+        select(ConnectProductTag.product_id).where(ConnectProductTag.connect_id == connect_id)
+    )).scalars().all()
+
+    from app.models.models import utcnow as _utcnow
+
+    new_cdi_ids: list[str] = []
+    neo4j_rels_by_type: dict[str, list[dict]] = {}
+
     for row_num, row in enumerate(data_rows, start=2):
         row_values = [str(v).strip() if v is not None else "" for v in row]
         if all(v == "" for v in row_values):
@@ -847,20 +876,13 @@ async def upload_excel(
             node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
 
             if node_type == 'CORE':
-                item = (await db.execute(
-                    select(CoreDataItem).where(
-                        CoreDataItem.english_value == value,
-                        CoreDataItem.core_id == sp.core_id,
-                        CoreDataItem.status == StatusEnum.ACTIVE,
-                    )
-                )).scalar_one_or_none()
-                if not item:
+                item_id = core_lookup_by_pos.get(sp.position_number, {}).get(value)
+                if not item_id:
                     row_errors.append(f"position {sp.position_number}: '{value}' not found in Core '{col_name}'")
                     row_failed = True
                 else:
-                    resolved_positions.append((sp.position_number, item.id, None))
+                    resolved_positions.append((sp.position_number, item_id, None))
             else:
-                # Excel upload for Connect-type positions is not yet supported
                 row_errors.append(f"position {sp.position_number}: Excel upload for Connect-type positions is not yet supported — use manual entry")
                 row_failed = True
 
@@ -878,44 +900,87 @@ async def upload_excel(
             continue
         existing_fingerprints.add(row_fingerprint)
 
-        # Read legacy creator/timestamp from Excel if present
         csv_creator = _get_col(headers, row_values, "Created By", "created_by", "Created by")
         csv_creator_name = str(csv_creator).strip() if csv_creator and str(csv_creator).strip() not in ("", "---") else None
         csv_ts = _parse_xlsx_datetime(_get_col(headers, row_values, "Created at", "created_at", "Created At"))
 
-        from app.models.models import utcnow as _utcnow
-        cdi = ConnectDataItem(
+        new_id = str(uuid.uuid4())
+        db.add(ConnectDataItem(
+            id=new_id,
             connect_id=connect_id,
             status=StatusEnum.ACTIVE,
             created_by=current_user.id,
             legacy_created_by_name=csv_creator_name,
             created_at=csv_ts or _utcnow(),
-        )
-        db.add(cdi)
-        await db.flush()
+        ))
 
         for pos_num, item_id, _ in resolved_positions:
             db.add(ConnectDataPosition(
-                connect_data_item_id=cdi.id,
+                connect_data_item_id=new_id,
                 position_number=pos_num,
                 core_data_item_id=item_id,
                 connect_data_item_ref_id=None,
             ))
 
-        neo_resolved = [(pos_num, item_id) for pos_num, item_id, _ in resolved_positions]
-        try:
-            create_neo4j_relationships(cdi.id, connect_id, neo_resolved, schema_positions)
-            resolved_count += 1
-        except Exception as e:
-            await db.rollback()
-            unresolved_count += 1
-            unresolved_details.append({"row": row_num, "errors": [f"Neo4J write failed: {str(e)}"]})
-            continue
+        sorted_pos = sorted(resolved_positions, key=lambda x: x[0])
+        for j in range(len(sorted_pos) - 1):
+            from_pos_num, from_item_id, _ = sorted_pos[j]
+            to_pos_num, to_item_id, _ = sorted_pos[j + 1]
+            from_schema = schema_map_by_pos[from_pos_num]
+            to_schema = schema_map_by_pos[to_pos_num]
+            from_type = from_schema.node_type.value if hasattr(from_schema.node_type, 'value') else str(from_schema.node_type)
+            to_type = to_schema.node_type.value if hasattr(to_schema.node_type, 'value') else str(to_schema.node_type)
+            if from_type == 'CONNECT' or to_type == 'CONNECT':
+                continue
+            rel_type = from_schema.relationship_type_to_next
+            neo4j_rels_by_type.setdefault(rel_type, []).append({
+                "from_id": from_item_id,
+                "to_id": to_item_id,
+                "cdi_id": new_id,
+                "from_pos": from_pos_num,
+                "to_pos": to_pos_num,
+            })
 
-        await write_sync_changes(db, EntityType.CONNECT_DATA_ITEM, cdi.id, ChangeType.ADDED, connect_id=connect_id)
+        new_cdi_ids.append(new_id)
+        resolved_count += 1
 
         if not connect.schema_finalised:
             connect.schema_finalised = True
+
+    # One Neo4J round trip per relationship type, instead of per row.
+    if neo4j_rels_by_type:
+        try:
+            with _neo_driver.session() as neo_session:
+                for rel_type, batch in neo4j_rels_by_type.items():
+                    neo_session.run(
+                        f"""
+                        UNWIND $rels AS row
+                        MATCH (a:CoreDataItem {{id: row.from_id}})
+                        MATCH (b:CoreDataItem {{id: row.to_id}})
+                        CREATE (a)-[:{rel_type} {{
+                            connect_data_item_id: row.cdi_id,
+                            connect_id: $connect_id,
+                            schema_position_from: row.from_pos,
+                            schema_position_to: row.to_pos,
+                            status: 'ACTIVE'
+                        }}]->(b)
+                        """,
+                        rels=batch,
+                        connect_id=connect_id,
+                    )
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=500, detail=f"Neo4J batch create failed: {str(e)}")
+
+    if new_cdi_ids and tagged_product_ids:
+        for cdi_id in new_cdi_ids:
+            for pid in tagged_product_ids:
+                db.add(SyncChangeLog(
+                    product_id=pid,
+                    entity_type=EntityType.CONNECT_DATA_ITEM,
+                    entity_id=cdi_id,
+                    change_type=ChangeType.ADDED,
+                ))
 
     await db.commit()
 
