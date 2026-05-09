@@ -6,7 +6,7 @@ from app.database import get_db
 from app.dependencies import require_role
 from app.models.models import (
     UserRole, ProductRegistry, CoreProductTag, ConnectProductTag,
-    SyncMode, StatusEnum,
+    Core, Connect, SyncMode, StatusEnum,
 )
 from app.schemas.sync import (
     ChangeTableResponse, DispatchRequest, DispatchResponse,
@@ -169,6 +169,56 @@ async def sync_history_detail(
         "items_failed": history.items_failed,
         "product_response": history.product_response,
     }
+
+
+@router.get("/{product_id}/tagged-entities")
+async def list_tagged_entities(
+    product_id: str,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """All Cores and Connects tagged to this product, in a flat list.
+    Used by the Sync UI in FULL mode so the user can pick exactly what to
+    dispatch (instead of being forced to send everything tagged)."""
+    product = (await db.execute(
+        select(ProductRegistry).where(ProductRegistry.id == product_id)
+    )).scalar_one_or_none()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    core_rows = (await db.execute(
+        select(CoreProductTag.core_id, CoreProductTag.entity_type_label,
+               Core.name, Core.core_type)
+        .join(Core, CoreProductTag.core_id == Core.id)
+        .where(CoreProductTag.product_id == product_id, Core.status == StatusEnum.ACTIVE)
+        .order_by(Core.name)
+    )).all()
+
+    connect_rows = (await db.execute(
+        select(ConnectProductTag.connect_id, ConnectProductTag.entity_type_label, Connect.name)
+        .join(Connect, ConnectProductTag.connect_id == Connect.id)
+        .where(ConnectProductTag.product_id == product_id, Connect.status == StatusEnum.ACTIVE)
+        .order_by(Connect.name)
+    )).all()
+
+    return [
+        {
+            "entity_id": r.core_id,
+            "entity_kind": "CORE",
+            "entity_name": r.name,
+            "entity_type_label": r.entity_type_label,
+            "core_type": r.core_type.value if hasattr(r.core_type, "value") else str(r.core_type),
+        }
+        for r in core_rows
+    ] + [
+        {
+            "entity_id": r.connect_id,
+            "entity_kind": "CONNECT",
+            "entity_name": r.name,
+            "entity_type_label": r.entity_type_label,
+        }
+        for r in connect_rows
+    ]
 
 
 @router.put("/{product_id}/entities/{entity_id}/label", status_code=status.HTTP_200_OK)
