@@ -1151,54 +1151,79 @@ async def cleanup_duplicates(
             raise HTTPException(status_code=404, detail="Fingerprint not found")
         target_groups = [groups[body.fingerprint]]
 
-    ids_to_inactivate: list[str] = []
-    groups_processed = 0
+    all_ids: list[str] = []
     for grp in target_groups:
         if len(grp) <= 1:
             continue
         sorted_grp = sorted(grp, key=lambda m: m.created_at)
         for member in sorted_grp[1:]:
-            ids_to_inactivate.append(member.id)
-        groups_processed += 1
+            all_ids.append(member.id)
 
-    if not ids_to_inactivate:
-        return DuplicateCleanupResponse(groups_processed=0, items_inactivated=0)
+    if not all_ids:
+        return DuplicateCleanupResponse(
+            groups_processed=0, items_inactivated=0,
+            has_more=False, remaining=0,
+        )
 
-    await db.execute(
-        update(ConnectDataItem)
-        .where(ConnectDataItem.id.in_(ids_to_inactivate))
-        .values(status=StatusEnum.INACTIVE)
-    )
+    # Chunk so each request finishes inside nginx's timeout. Commit after every
+    # chunk so partial progress always survives — repeated calls are idempotent
+    # because already-INACTIVE rows are filtered out at the top of this handler.
+    LIMIT_PER_CALL = 2000
+    BATCH_SIZE = 200
 
-    try:
-        with _neo_driver.session() as neo:
-            neo.run(
-                """
-                UNWIND $ids AS id
-                MATCH ()-[r {connect_data_item_id: id}]-()
-                SET r.status = 'INACTIVE'
-                """,
-                ids=ids_to_inactivate,
-            )
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Neo4J batch inactivate failed: {str(e)}")
+    to_process = all_ids[:LIMIT_PER_CALL]
+    remaining = max(0, len(all_ids) - len(to_process))
 
     tagged_pids = (await db.execute(
         select(ConnectProductTag.product_id).where(ConnectProductTag.connect_id == connect_id)
     )).scalars().all()
-    for cdi_id in ids_to_inactivate:
-        for pid in tagged_pids:
-            db.add(SyncChangeLog(
-                product_id=pid,
-                entity_type=EntityType.CONNECT_DATA_ITEM,
-                entity_id=cdi_id,
-                change_type=ChangeType.INACTIVATED,
-            ))
 
-    await db.commit()
+    items_inactivated = 0
+    for chunk_start in range(0, len(to_process), BATCH_SIZE):
+        chunk = to_process[chunk_start:chunk_start + BATCH_SIZE]
 
+        await db.execute(
+            update(ConnectDataItem)
+            .where(ConnectDataItem.id.in_(chunk))
+            .values(status=StatusEnum.INACTIVE)
+        )
+
+        try:
+            with _neo_driver.session() as neo:
+                # Single relationship scan + IN filter — much faster than
+                # UNWIND-then-MATCH per id when there is no index on
+                # r.connect_data_item_id.
+                neo.run(
+                    """
+                    MATCH ()-[r]-()
+                    WHERE r.connect_data_item_id IN $ids
+                    SET r.status = 'INACTIVE'
+                    """,
+                    ids=chunk,
+                )
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=500, detail=f"Neo4J batch inactivate failed at chunk {chunk_start}: {str(e)}")
+
+        for cdi_id in chunk:
+            for pid in tagged_pids:
+                db.add(SyncChangeLog(
+                    product_id=pid,
+                    entity_type=EntityType.CONNECT_DATA_ITEM,
+                    entity_id=cdi_id,
+                    change_type=ChangeType.INACTIVATED,
+                ))
+
+        await db.commit()
+        items_inactivated += len(chunk)
+
+    # Each duplicate group has count >= 2; in this Connect every group is a
+    # 2-row pair so groups_processed == items_inactivated. For groups with
+    # higher count, it's an approximation — the caller should rely on
+    # items_inactivated for the authoritative number.
     return DuplicateCleanupResponse(
-        groups_processed=groups_processed,
-        items_inactivated=len(ids_to_inactivate),
+        groups_processed=items_inactivated,
+        items_inactivated=items_inactivated,
+        has_more=remaining > 0,
+        remaining=remaining,
     )

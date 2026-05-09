@@ -144,3 +144,5 @@ class DuplicateCleanupRequest(BaseModel):
 class DuplicateCleanupResponse(BaseModel):
     groups_processed: int
     items_inactivated: int
+    has_more: bool = False
+    remaining: int = 0
