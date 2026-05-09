@@ -87,6 +87,7 @@ class ConnectProductTagOut(BaseModel):
     id: str
     connect_id: str
     product_id: str
+    entity_type_label: Optional[str] = None
 
     class Config:
         from_attributes = True
