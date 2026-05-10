@@ -108,3 +108,37 @@ class BulkUploadReport(BaseModel):
     skipped_duplicates: int
     translations_imported: int = 0
     errors: List[str]
+
+
+class CoreDuplicateRow(BaseModel):
+    id: str
+    english_value: str
+    created_at: Optional[str] = None
+    legacy_created_by_name: Optional[str] = None
+
+
+class CoreDuplicateGroup(BaseModel):
+    key: str            # lowercased english_value used for grouping
+    display_value: str  # actual english_value of the first row (for display)
+    count: int
+    rows: List[CoreDuplicateRow]
+
+
+class CoreDuplicatesResponse(BaseModel):
+    total_groups: int
+    total_extra_items: int
+    skip: int
+    limit: int
+    groups: List[CoreDuplicateGroup]
+
+
+class CoreDuplicateCleanupRequest(BaseModel):
+    key: Optional[str] = None
+    all: bool = False
+
+
+class CoreDuplicateCleanupResponse(BaseModel):
+    groups_processed: int
+    items_inactivated: int
+    has_more: bool = False
+    remaining: int = 0

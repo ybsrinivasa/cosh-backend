@@ -3,20 +3,23 @@ import io
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
     CoreProductTag, ProductRegistry, LanguageRegistry, User, MediaItem,
-    UserRole, StatusEnum, CoreType, ContentType, ValidationStatus
+    UserRole, StatusEnum, CoreType, ContentType, ValidationStatus,
+    ConnectDataPosition, SyncChangeLog,
 )
 from app.schemas.cores import (
     CoreCreate, CoreUpdate, CoreStatusUpdate, CoreOut,
     CoreDataItemCreate, CoreDataItemUpdate, CoreDataItemStatusUpdate,
     CoreDataItemOut, CoreLanguageConfigOut, CoreProductTagOut,
-    BulkUploadReport, TranslationOut
+    BulkUploadReport, TranslationOut,
+    CoreDuplicatesResponse, CoreDuplicateGroup, CoreDuplicateRow,
+    CoreDuplicateCleanupRequest, CoreDuplicateCleanupResponse,
 )
 from app.services.core_service import (
     name_is_unique_for_core, get_core, get_item,
@@ -994,3 +997,193 @@ async def import_translations_csv(
         "skipped": skipped,
         "errors": errors,
     }
+
+
+# ── Duplicate detection & cleanup ─────────────────────────────────────────────
+# Two ACTIVE CoreDataItems with the same lower(english_value) are duplicates.
+# Cleanup keeps the oldest, repoints every ConnectDataPosition that referenced
+# a duplicate to the survivor (so dependent Connect rows are preserved), then
+# inactivates the duplicates. Same UX pattern as the Connects Duplicates tab.
+
+@router.get("/{core_id}/duplicates", response_model=CoreDuplicatesResponse)
+async def list_core_duplicates(
+    core_id: str,
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """Group ACTIVE CoreDataItems by lower(english_value); return groups with
+    count > 1, oldest-first within each group."""
+    await get_core(db, core_id)
+
+    items = (await db.execute(
+        select(CoreDataItem).where(
+            CoreDataItem.core_id == core_id,
+            CoreDataItem.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+
+    groups: dict[str, list[CoreDataItem]] = {}
+    for it in items:
+        key = (it.english_value or "").strip().lower()
+        if not key:
+            continue
+        groups.setdefault(key, []).append(it)
+
+    dup_groups = [(k, v) for k, v in groups.items() if len(v) > 1]
+    dup_groups.sort(key=lambda g: (-len(g[1]), min(m.created_at for m in g[1])))
+
+    total_groups = len(dup_groups)
+    total_extra = sum(len(v) - 1 for _, v in dup_groups)
+
+    page = dup_groups[skip:skip + limit]
+
+    out_groups: list[CoreDuplicateGroup] = []
+    for key, members in page:
+        sorted_members = sorted(members, key=lambda m: m.created_at)
+        rows = [
+            CoreDuplicateRow(
+                id=m.id,
+                english_value=m.english_value,
+                created_at=m.created_at.isoformat() if m.created_at else None,
+                legacy_created_by_name=m.legacy_created_by_name,
+            )
+            for m in sorted_members
+        ]
+        out_groups.append(CoreDuplicateGroup(
+            key=key,
+            display_value=sorted_members[0].english_value,
+            count=len(members),
+            rows=rows,
+        ))
+
+    return CoreDuplicatesResponse(
+        total_groups=total_groups,
+        total_extra_items=total_extra,
+        skip=skip,
+        limit=limit,
+        groups=out_groups,
+    )
+
+
+@router.post("/{core_id}/duplicates/cleanup", response_model=CoreDuplicateCleanupResponse)
+async def cleanup_core_duplicates(
+    core_id: str,
+    body: CoreDuplicateCleanupRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer),
+):
+    """For each duplicate group: keep the oldest, repoint every Connect
+    reference from the drops to the keeper, transfer Neo4J relationships,
+    then inactivate the drops. Chunked + idempotent so the client can loop
+    until has_more=false even if a single call hits the nginx timeout."""
+    await get_core(db, core_id)
+
+    if not body.key and not body.all:
+        raise HTTPException(status_code=422, detail="Provide key or set all=true")
+
+    items = (await db.execute(
+        select(CoreDataItem).where(
+            CoreDataItem.core_id == core_id,
+            CoreDataItem.status == StatusEnum.ACTIVE,
+        )
+    )).scalars().all()
+
+    groups: dict[str, list[CoreDataItem]] = {}
+    for it in items:
+        key = (it.english_value or "").strip().lower()
+        if not key:
+            continue
+        groups.setdefault(key, []).append(it)
+
+    if body.all:
+        target_groups = [g for g in groups.values() if len(g) > 1]
+    else:
+        if body.key not in groups:
+            raise HTTPException(status_code=404, detail="Key not found")
+        target_groups = [groups[body.key]]
+
+    keep_drop_pairs: list[tuple[str, str]] = []  # (keep_id, drop_id)
+    for grp in target_groups:
+        if len(grp) <= 1:
+            continue
+        sorted_grp = sorted(grp, key=lambda m: m.created_at)
+        keep_id = sorted_grp[0].id
+        for member in sorted_grp[1:]:
+            keep_drop_pairs.append((keep_id, member.id))
+
+    if not keep_drop_pairs:
+        return CoreDuplicateCleanupResponse(
+            groups_processed=0, items_inactivated=0,
+            has_more=False, remaining=0,
+        )
+
+    # Neo4J relationship transfer is more expensive than the Connects case
+    # (uses APOC + per-pair queries), so chunk smaller.
+    LIMIT_PER_CALL = 500
+    BATCH_SIZE = 50
+
+    pairs_to_process = keep_drop_pairs[:LIMIT_PER_CALL]
+    remaining = max(0, len(keep_drop_pairs) - len(pairs_to_process))
+
+    tagged_pids = (await db.execute(
+        select(CoreProductTag.product_id).where(CoreProductTag.core_id == core_id)
+    )).scalars().all()
+
+    items_inactivated = 0
+    for chunk_start in range(0, len(pairs_to_process), BATCH_SIZE):
+        chunk = pairs_to_process[chunk_start:chunk_start + BATCH_SIZE]
+        drop_ids = [d for _, d in chunk]
+
+        # Repoint every ConnectDataPosition that pointed at a drop. We do one
+        # UPDATE per pair because the SQL update needs to know the keep_id —
+        # bulk CASE would be marginally faster but the chunk size is small.
+        for keep_id, drop_id in chunk:
+            await db.execute(
+                update(ConnectDataPosition)
+                .where(ConnectDataPosition.core_data_item_id == drop_id)
+                .values(core_data_item_id=keep_id)
+            )
+
+        # Transfer Neo4J relationships from drop → keep within one session,
+        # then drop the duplicate node. Reuse the helper proven by the
+        # Similarity Review's MERGE action.
+        try:
+            from app.services.similarity_service import _transfer_neo4j_relationships
+            for keep_id, drop_id in chunk:
+                _transfer_neo4j_relationships(drop_id, keep_id)
+            with _neo_driver.session() as neo:
+                neo.run(
+                    "MATCH (n:CoreDataItem) WHERE n.id IN $ids SET n.status = 'INACTIVE'",
+                    ids=drop_ids,
+                )
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=500, detail=f"Neo4J transfer failed at chunk {chunk_start}: {str(e)}")
+
+        # Inactivate the drops in Postgres.
+        await db.execute(
+            update(CoreDataItem)
+            .where(CoreDataItem.id.in_(drop_ids))
+            .values(status=StatusEnum.INACTIVE)
+        )
+
+        for drop_id in drop_ids:
+            for pid in tagged_pids:
+                db.add(SyncChangeLog(
+                    product_id=pid,
+                    entity_type=EntityType.CORE_DATA_ITEM,
+                    entity_id=drop_id,
+                    change_type=ChangeType.INACTIVATED,
+                ))
+
+        await db.commit()
+        items_inactivated += len(chunk)
+
+    return CoreDuplicateCleanupResponse(
+        groups_processed=items_inactivated,  # 1 drop = 1 group processed for 2-row groups; approximation otherwise
+        items_inactivated=items_inactivated,
+        has_more=remaining > 0,
+        remaining=remaining,
+    )
