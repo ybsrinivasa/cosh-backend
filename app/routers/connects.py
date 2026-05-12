@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, insert
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
@@ -851,6 +851,11 @@ async def upload_excel(
 
     new_cdi_ids: list[str] = []
     neo4j_rels_by_type: dict[str, list[dict]] = {}
+    # Collect rows for bulk INSERT at the end instead of db.add()-per-row, which
+    # otherwise generates one Postgres round-trip per row at commit time and
+    # makes big files (>10k rows) breach the nginx 300s timeout.
+    cdi_rows: list[dict] = []
+    cdp_rows: list[dict] = []
 
     for row_num, row in enumerate(data_rows, start=2):
         row_values = [str(v).strip() if v is not None else "" for v in row]
@@ -907,22 +912,22 @@ async def upload_excel(
         csv_ts = _parse_xlsx_datetime(_get_col(headers, row_values, "Created at", "created_at", "Created At"))
 
         new_id = str(uuid.uuid4())
-        db.add(ConnectDataItem(
-            id=new_id,
-            connect_id=connect_id,
-            status=StatusEnum.ACTIVE,
-            created_by=current_user.id,
-            legacy_created_by_name=csv_creator_name,
-            created_at=csv_ts or _utcnow(),
-        ))
+        cdi_rows.append({
+            "id": new_id,
+            "connect_id": connect_id,
+            "status": StatusEnum.ACTIVE,
+            "created_by": current_user.id,
+            "legacy_created_by_name": csv_creator_name,
+            "created_at": csv_ts or _utcnow(),
+        })
 
         for pos_num, item_id, _ in resolved_positions:
-            db.add(ConnectDataPosition(
-                connect_data_item_id=new_id,
-                position_number=pos_num,
-                core_data_item_id=item_id,
-                connect_data_item_ref_id=None,
-            ))
+            cdp_rows.append({
+                "connect_data_item_id": new_id,
+                "position_number": pos_num,
+                "core_data_item_id": item_id,
+                "connect_data_item_ref_id": None,
+            })
 
         sorted_pos = sorted(resolved_positions, key=lambda x: x[0])
         for j in range(len(sorted_pos) - 1):
@@ -948,6 +953,20 @@ async def upload_excel(
 
         if not connect.schema_finalised:
             connect.schema_finalised = True
+
+    # Bulk INSERT in chunks so Postgres sees a few large statements rather
+    # than one round-trip per row. 5000 rows per statement is a comfortable
+    # middle ground for the asyncpg driver — fast and well under the per-
+    # statement parameter limit (~32k bind params at 6 cols * 5k rows).
+    INSERT_CHUNK = 5000
+
+    if cdi_rows:
+        for i in range(0, len(cdi_rows), INSERT_CHUNK):
+            await db.execute(insert(ConnectDataItem), cdi_rows[i:i + INSERT_CHUNK])
+
+    if cdp_rows:
+        for i in range(0, len(cdp_rows), INSERT_CHUNK):
+            await db.execute(insert(ConnectDataPosition), cdp_rows[i:i + INSERT_CHUNK])
 
     # One Neo4J round trip per relationship type, instead of per row.
     if neo4j_rels_by_type:
@@ -975,14 +994,18 @@ async def upload_excel(
             raise HTTPException(status_code=500, detail=f"Neo4J batch create failed: {str(e)}")
 
     if new_cdi_ids and tagged_product_ids:
-        for cdi_id in new_cdi_ids:
-            for pid in tagged_product_ids:
-                db.add(SyncChangeLog(
-                    product_id=pid,
-                    entity_type=EntityType.CONNECT_DATA_ITEM,
-                    entity_id=cdi_id,
-                    change_type=ChangeType.ADDED,
-                ))
+        scl_rows = [
+            {
+                "product_id": pid,
+                "entity_type": EntityType.CONNECT_DATA_ITEM,
+                "entity_id": cdi_id,
+                "change_type": ChangeType.ADDED,
+            }
+            for cdi_id in new_cdi_ids
+            for pid in tagged_product_ids
+        ]
+        for i in range(0, len(scl_rows), INSERT_CHUNK):
+            await db.execute(insert(SyncChangeLog), scl_rows[i:i + INSERT_CHUNK])
 
     await db.commit()
 

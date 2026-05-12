@@ -3,7 +3,7 @@ import io
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, insert
 from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
@@ -590,7 +590,13 @@ async def upload_csv(
         for t in trans_q.scalars().all():
             existing_trans_by_key[(t.item_id, t.language_code)] = t
 
-    new_items: list[CoreDataItem] = []  # buffered for batched Neo4J create
+    # Bulk-insert collectors. Previously every new item / media / translation
+    # went through db.add(), which becomes one Postgres round-trip per object
+    # at commit time and blew past the nginx 300s timeout on big CSVs. Now we
+    # collect dicts and emit a few large INSERT...VALUES statements at the end.
+    new_item_rows: list[dict] = []
+    new_media_rows: list[dict] = []
+    new_trans_rows: list[dict] = []
 
     for i, row in enumerate(rows, start=2):
         english_value = (
@@ -625,38 +631,43 @@ async def upload_csv(
 
         if existing:
             skipped += 1
-            item = existing
+            item_id_for_row = existing.id if hasattr(existing, "id") else existing
             if is_media and s3_url:
-                existing_media = existing_media_by_item.get(existing.id)
-                if existing_media and existing_media.s3_url != s3_url:
-                    existing_media.s3_url = s3_url
-                elif not existing_media:
-                    new_media = MediaItem(item_id=existing.id, s3_url=s3_url,
-                                          content_type=core.content_type or ContentType.IMAGE)
-                    db.add(new_media)
-                    existing_media_by_item[existing.id] = new_media
+                existing_media = existing_media_by_item.get(item_id_for_row)
+                if existing_media is not None and hasattr(existing_media, "s3_url"):
+                    # An ORM MediaItem (from the pre-fetch) — update in place.
+                    if existing_media.s3_url != s3_url:
+                        existing_media.s3_url = s3_url
+                elif existing_media is None:
+                    new_media_rows.append({
+                        "item_id": item_id_for_row,
+                        "s3_url": s3_url,
+                        "content_type": core.content_type or ContentType.IMAGE,
+                    })
+                    existing_media_by_item[item_id_for_row] = True  # sentinel
         else:
             new_id = new_uuid()
-            item = CoreDataItem(
-                id=new_id,
-                core_id=core_id,
-                english_value=english_value,
-                legacy_item_id=row.get("id") or row.get("legacy_id") or None,
-                status=StatusEnum.ACTIVE,
-                created_by=current_user.id,
-                legacy_created_by_name=csv_created_by_name,
-                created_at=csv_created_at or _utcnow_fn(),
-            )
-            db.add(item)
-            new_items.append(item)
-            existing_by_name[key] = item
+            item_id_for_row = new_id
+            new_item_rows.append({
+                "id": new_id,
+                "core_id": core_id,
+                "english_value": english_value,
+                "legacy_item_id": row.get("id") or row.get("legacy_id") or None,
+                "status": StatusEnum.ACTIVE,
+                "created_by": current_user.id,
+                "legacy_created_by_name": csv_created_by_name,
+                "created_at": csv_created_at or _utcnow_fn(),
+            })
+            existing_by_name[key] = new_id  # sentinel — only its truthiness matters from here on
             created += 1
 
             if is_media and s3_url:
-                new_media = MediaItem(item_id=new_id, s3_url=s3_url,
-                                      content_type=core.content_type or ContentType.IMAGE)
-                db.add(new_media)
-                existing_media_by_item[new_id] = new_media
+                new_media_rows.append({
+                    "item_id": new_id,
+                    "s3_url": s3_url,
+                    "content_type": core.content_type or ContentType.IMAGE,
+                })
+                existing_media_by_item[new_id] = True
 
         if is_media:
             continue
@@ -670,25 +681,41 @@ async def upload_csv(
             is_expert = raw_status in ("EXPERT_VALIDATED", "TRUE", "1", "YES", "VALIDATED")
             validation_status = ValidationStatus.EXPERT_VALIDATED if is_expert else ValidationStatus.MACHINE_GENERATED
 
-            existing_trans = existing_trans_by_key.get((item.id, lang))
-            if existing_trans:
+            existing_trans = existing_trans_by_key.get((item_id_for_row, lang))
+            if existing_trans is not None and hasattr(existing_trans, "validation_status"):
+                # ORM row pre-fetched — keep the existing update path.
                 if existing_trans.validation_status == ValidationStatus.EXPERT_VALIDATED and not is_expert:
                     continue
                 existing_trans.translated_value = translated_value
                 existing_trans.validation_status = validation_status
             else:
-                new_trans = CoreDataTranslation(
-                    item_id=item.id,
-                    language_code=lang,
-                    translated_value=translated_value,
-                    validation_status=validation_status,
-                )
-                db.add(new_trans)
-                existing_trans_by_key[(item.id, lang)] = new_trans
+                new_trans_rows.append({
+                    "item_id": item_id_for_row,
+                    "language_code": lang,
+                    "translated_value": translated_value,
+                    "validation_status": validation_status,
+                })
+                existing_trans_by_key[(item_id_for_row, lang)] = True
             translations_imported += 1
 
+    # Bulk-insert in chunks. 5000 rows per statement stays comfortably under
+    # asyncpg's ~32k bind-parameter ceiling at our column counts.
+    INSERT_CHUNK = 5000
+
+    if new_item_rows:
+        for i in range(0, len(new_item_rows), INSERT_CHUNK):
+            await db.execute(insert(CoreDataItem), new_item_rows[i:i + INSERT_CHUNK])
+
+    if new_media_rows:
+        for i in range(0, len(new_media_rows), INSERT_CHUNK):
+            await db.execute(insert(MediaItem), new_media_rows[i:i + INSERT_CHUNK])
+
+    if new_trans_rows:
+        for i in range(0, len(new_trans_rows), INSERT_CHUNK):
+            await db.execute(insert(CoreDataTranslation), new_trans_rows[i:i + INSERT_CHUNK])
+
     # Batched Neo4J create — one round trip for all new items.
-    if new_items:
+    if new_item_rows:
         try:
             with _neo_driver.session() as neo_session:
                 neo_session.run(
@@ -701,8 +728,8 @@ async def upload_csv(
                         status: 'ACTIVE'
                     })
                     """,
-                    items=[{"id": it.id, "core_id": it.core_id, "english_value": it.english_value}
-                           for it in new_items],
+                    items=[{"id": r["id"], "core_id": r["core_id"], "english_value": r["english_value"]}
+                           for r in new_item_rows],
                 )
         except Exception as e:
             await db.rollback()
