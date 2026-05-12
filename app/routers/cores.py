@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, insert
 from sqlalchemy.orm import selectinload
-from app.database import get_db
+from app.database import get_db, acquire_entity_lock
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Folder, Core, CoreDataItem, CoreDataTranslation, CoreLanguageConfig,
@@ -518,6 +518,11 @@ async def upload_csv(
     core = await get_core(db, core_id, current_user)
     check_stocker_exclusive_write(core.assigned_stocker_id, current_user)
     is_media = core.core_type == CoreType.MEDIA
+
+    # Block any concurrent upload to this same Core. See acquire_entity_lock
+    # docstring for why — it's what prevents a 504-then-retry from doubling
+    # the file.
+    await acquire_entity_lock(db, "core_upload", core_id)
 
     content = await file.read()
     try:

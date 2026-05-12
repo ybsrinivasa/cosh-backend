@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, insert
 from sqlalchemy.orm import selectinload
-from app.database import get_db
+from app.database import get_db, acquire_entity_lock
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
 from app.models.models import (
     Connect, ConnectSchemaPosition, ConnectDataItem, ConnectDataPosition,
@@ -725,6 +725,11 @@ async def upload_excel(
 ):
     connect = await get_connect(db, connect_id, current_user)
     check_stocker_exclusive_write(connect.assigned_stocker_id, current_user)
+
+    # Block any concurrent upload to this same Connect until we commit. Without
+    # this, two parallel requests both load existing_fingerprints before either
+    # commits and end up double-inserting the file.
+    await acquire_entity_lock(db, "connect_upload", connect_id)
 
     schema_result = await db.execute(
         select(ConnectSchemaPosition)
