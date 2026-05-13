@@ -716,6 +716,124 @@ async def update_connect_data_status(
 
 # ── Excel Upload (BL-C-04) ─────────────────────────────────────────────────────
 
+async def _build_upload_descriptors(db: AsyncSession, schema_positions):
+    """Resolve the expected column descriptors for an upload to a Connect.
+
+    A CORE-type schema position produces 1 descriptor (one column in the file).
+    A CONNECT-type schema position expands into N descriptors — one per CORE
+    position inside the referenced Connect — so the user lists each component
+    of the referenced row as its own column instead of cramming them into one
+    cell with a fragile delimiter.
+
+    Returns (descriptors, ref_connect_schemas) where:
+      descriptors: list of dicts, in column order, each with keys
+        target_pos, ref_pos, core_id, ref_connect_id, name, col_name
+      ref_connect_schemas: dict[ref_connect_id -> list[ConnectSchemaPosition]]
+        for any CONNECT-type position in the schema; useful to the caller for
+        pre-fetching the (fingerprint -> CDI id) map for each.
+
+    Nested CONNECT-of-CONNECT is rejected — supporting it would require
+    recursive sub-column expansion and is out of scope for upload today.
+    """
+    ref_connect_schemas: dict[str, list] = {}
+    for sp in schema_positions:
+        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+        if node_type == 'CONNECT' and sp.connect_ref_id and sp.connect_ref_id not in ref_connect_schemas:
+            rsps = (await db.execute(
+                select(ConnectSchemaPosition)
+                .where(ConnectSchemaPosition.connect_id == sp.connect_ref_id)
+                .order_by(ConnectSchemaPosition.position_number)
+            )).scalars().all()
+            for rsp in rsps:
+                rsp_type = rsp.node_type.value if hasattr(rsp.node_type, 'value') else str(rsp.node_type)
+                if rsp_type != 'CORE':
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Position {sp.position_number} references a Connect whose own "
+                            "schema contains a Connect-type position. Excel upload supports "
+                            "only one level of nesting — every position inside the referenced "
+                            "Connect must be a Core. Use manual entry for this row."
+                        ),
+                    )
+            ref_connect_schemas[sp.connect_ref_id] = rsps
+
+    raw: list[dict] = []
+    for sp in schema_positions:
+        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+        if node_type == 'CORE':
+            if sp.position_label and sp.position_label.strip():
+                name = sp.position_label.strip()
+            elif sp.core_id:
+                core = (await db.execute(select(Core).where(Core.id == sp.core_id))).scalar_one_or_none()
+                name = core.name if core else sp.core_id
+            else:
+                name = f"Position {sp.position_number}"
+            raw.append({
+                "target_pos": sp.position_number,
+                "ref_pos": None,
+                "core_id": sp.core_id,
+                "ref_connect_id": None,
+                "name": name,
+            })
+        else:
+            for rsp in ref_connect_schemas[sp.connect_ref_id]:
+                if rsp.position_label and rsp.position_label.strip():
+                    name = rsp.position_label.strip()
+                elif rsp.core_id:
+                    core = (await db.execute(select(Core).where(Core.id == rsp.core_id))).scalar_one_or_none()
+                    name = core.name if core else rsp.core_id
+                else:
+                    name = f"Position {rsp.position_number}"
+                raw.append({
+                    "target_pos": sp.position_number,
+                    "ref_pos": rsp.position_number,
+                    "core_id": rsp.core_id,
+                    "ref_connect_id": sp.connect_ref_id,
+                    "name": name,
+                })
+
+    seen: dict[str, int] = {}
+    for desc in raw:
+        n = seen.get(desc["name"], 0)
+        seen[desc["name"]] = n + 1
+        desc["col_name"] = desc["name"] if n == 0 else f"{desc['name']} ({n + 1})"
+
+    return raw, ref_connect_schemas
+
+
+@router.get("/{connect_id}/upload-columns")
+async def get_upload_columns(
+    connect_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """Return the ordered list of expected column names for this Connect's
+    Excel/CSV upload. CONNECT-type schema positions are expanded into their
+    referenced Connect's CORE position columns so the user can see exactly
+    what the file's first row needs to look like."""
+    await get_connect(db, connect_id, current_user)
+    schema_positions = (await db.execute(
+        select(ConnectSchemaPosition)
+        .where(ConnectSchemaPosition.connect_id == connect_id)
+        .order_by(ConnectSchemaPosition.position_number)
+    )).scalars().all()
+    if not schema_positions:
+        return {"columns": []}
+    descriptors, _ = await _build_upload_descriptors(db, schema_positions)
+    return {
+        "columns": [
+            {
+                "col_name": d["col_name"],
+                "target_pos": d["target_pos"],
+                "ref_pos": d["ref_pos"],
+                "is_connect_sub": d["ref_pos"] is not None,
+            }
+            for d in descriptors
+        ]
+    }
+
+
 @router.post("/{connect_id}/items/upload-excel", response_model=ExcelUploadReport)
 async def upload_excel(
     connect_id: str,
@@ -765,31 +883,13 @@ async def upload_excel(
     headers = [str(h).strip() if h else "" for h in rows[0]]
     data_rows = rows[1:]
 
-    # Build column names per position. Position-label wins; otherwise the Core
-    # (or Connect) name. When the same fallback name appears multiple times in
-    # one schema, both labels and the upload resolution treat the second/third
-    # occurrence as "Name (2)", "Name (3)" — keeps duplicate-Core schemas
-    # disambiguated even without an explicit position_label.
-    raw_names: list[str] = []
-    for sp in schema_positions:
-        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
-        if sp.position_label and sp.position_label.strip():
-            raw_names.append(sp.position_label.strip())
-        elif node_type == 'CORE' and sp.core_id:
-            core = (await db.execute(select(Core).where(Core.id == sp.core_id))).scalar_one_or_none()
-            raw_names.append(core.name if core else sp.core_id)
-        elif sp.connect_ref_id:
-            ref_connect = (await db.execute(select(Connect).where(Connect.id == sp.connect_ref_id))).scalar_one_or_none()
-            raw_names.append(ref_connect.name if ref_connect else sp.connect_ref_id)
-        else:
-            raw_names.append(f"Position {sp.position_number}")
-
-    seen: dict[str, int] = {}
-    position_names: list[str] = []
-    for name in raw_names:
-        n = seen.get(name, 0)
-        seen[name] = n + 1
-        position_names.append(name if n == 0 else f"{name} ({n + 1})")
+    # Resolve the expected column descriptors. A CORE-type schema position is
+    # one column; a CONNECT-type position expands into N columns — one per CORE
+    # position inside the referenced Connect — so the user lists every component
+    # of the referenced row as its own column instead of encoding them all in
+    # one cell with a fragile delimiter. Nested CONNECT-of-CONNECT is rejected
+    # with a clear error.
+    raw_descriptors, ref_connect_schemas = await _build_upload_descriptors(db, schema_positions)
 
     resolved_count = 0
     unresolved_count = 0
@@ -830,22 +930,47 @@ async def upload_excel(
     )).scalars().all()
     existing_fingerprints = {_make_fingerprint(item.positions) for item in existing_items}
 
-    # Pre-fetch every Core's items into a per-position lookup dict so the row loop
-    # never hits the database for resolution. With 4 positions × 7000 rows the
-    # naive path was 28k SELECTs and pushed past nginx's 504 timeout.
-    core_lookup_by_pos: dict[int, dict[str, str]] = {}
-    for sp in schema_positions:
-        node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
-        if node_type == 'CORE' and sp.core_id:
-            rows_q = (await db.execute(
-                select(CoreDataItem.id, CoreDataItem.english_value).where(
-                    CoreDataItem.core_id == sp.core_id,
-                    CoreDataItem.status == StatusEnum.ACTIVE,
-                )
-            )).all()
-            core_lookup_by_pos[sp.position_number] = {r.english_value: r.id for r in rows_q}
+    # Pre-fetch every Core's items into one (english_value -> id) lookup map
+    # so the row loop never hits the database for resolution. Covers both
+    # direct CORE positions on the target Connect AND the CORE positions
+    # inside any referenced Connect (used to resolve a CONNECT-type position
+    # to a specific row in that referenced Connect).
+    core_lookup: dict[str, dict[str, str]] = {}
+    for core_id in {d["core_id"] for d in raw_descriptors if d["core_id"]}:
+        rows_q = (await db.execute(
+            select(CoreDataItem.id, CoreDataItem.english_value).where(
+                CoreDataItem.core_id == core_id,
+                CoreDataItem.status == StatusEnum.ACTIVE,
+            )
+        )).all()
+        core_lookup[core_id] = {r.english_value: r.id for r in rows_q}
+
+    # Pre-fetch (fingerprint -> CDI id) maps for every referenced Connect so a
+    # CONNECT-type position can resolve to an existing row in O(1) per upload
+    # row. The user is expected to dedupe the referenced Connect via its own
+    # Duplicates tab first; if duplicates still exist we keep the oldest so
+    # behaviour is stable across re-uploads.
+    ref_fp_to_cdi: dict[str, dict[str, str]] = {}
+    for ref_cid in ref_connect_schemas.keys():
+        ref_items = (await db.execute(
+            select(ConnectDataItem)
+            .options(selectinload(ConnectDataItem.positions))
+            .where(ConnectDataItem.connect_id == ref_cid, ConnectDataItem.status == StatusEnum.ACTIVE)
+            .order_by(ConnectDataItem.created_at)
+        )).scalars().all()
+        fp_map: dict[str, str] = {}
+        for ri in ref_items:
+            fp = "|".join(
+                f"{p.position_number}:{p.connect_data_item_ref_id or p.core_data_item_id}"
+                for p in sorted(ri.positions, key=lambda x: x.position_number)
+            )
+            fp_map.setdefault(fp, ri.id)
+        ref_fp_to_cdi[ref_cid] = fp_map
 
     schema_map_by_pos = {sp.position_number: sp for sp in schema_positions}
+    target_pos_to_desc_idxs: dict[int, list[int]] = {}
+    for idx, d in enumerate(raw_descriptors):
+        target_pos_to_desc_idxs.setdefault(d["target_pos"], []).append(idx)
 
     # Tagged products: fetch once so we can buffer SyncChangeLog rows in-memory.
     tagged_product_ids = (await db.execute(
@@ -871,41 +996,86 @@ async def upload_excel(
         row_failed = False
         row_errors = []
 
-        for i, sp in enumerate(schema_positions):
-            col_name = position_names[i]
+        # Read every expected column up front (using exact name match with a
+        # positional fallback for backward compat with simple CORE-only files).
+        desc_values: list[str] = []
+        for desc_idx, desc in enumerate(raw_descriptors):
             try:
-                col_idx = headers.index(col_name)
-                value = row_values[col_idx] if col_idx < len(row_values) else ""
+                col_idx = headers.index(desc["col_name"])
+                v = row_values[col_idx] if col_idx < len(row_values) else ""
             except ValueError:
-                value = row_values[i] if i < len(row_values) else ""
+                v = row_values[desc_idx] if desc_idx < len(row_values) else ""
+            desc_values.append(v)
 
-            if not value:
-                row_errors.append(f"position {sp.position_number}: empty value")
-                row_failed = True
-                continue
-
-            value = value.removeprefix("ID_").removesuffix("|")
+        for sp in schema_positions:
             node_type = sp.node_type.value if hasattr(sp.node_type, 'value') else str(sp.node_type)
+            desc_idxs = target_pos_to_desc_idxs[sp.position_number]
 
             if node_type == 'CORE':
-                item_id = core_lookup_by_pos.get(sp.position_number, {}).get(value)
+                desc_idx = desc_idxs[0]
+                desc = raw_descriptors[desc_idx]
+                value = desc_values[desc_idx]
+                if not value:
+                    row_errors.append(f"position {sp.position_number}: empty value for column '{desc['col_name']}'")
+                    row_failed = True
+                    continue
+                value = value.removeprefix("ID_").removesuffix("|")
+                item_id = core_lookup.get(desc["core_id"], {}).get(value)
                 if not item_id:
-                    row_errors.append(f"position {sp.position_number}: '{value}' not found in Core '{col_name}'")
+                    row_errors.append(f"position {sp.position_number}: '{value}' not found in Core '{desc['col_name']}'")
                     row_failed = True
                 else:
                     resolved_positions.append((sp.position_number, item_id, None))
             else:
-                row_errors.append(f"position {sp.position_number}: Excel upload for Connect-type positions is not yet supported — use manual entry")
-                row_failed = True
+                # CONNECT-type: resolve every sub-column to a CoreDataItem id,
+                # build a fingerprint, then look up the matching row in the
+                # referenced Connect. If any sub-column fails, the row fails.
+                sub_resolved: list[tuple[int, str]] = []
+                sub_human: list[str] = []
+                sub_failed = False
+                for desc_idx in desc_idxs:
+                    desc = raw_descriptors[desc_idx]
+                    value = desc_values[desc_idx]
+                    sub_human.append(value or "(empty)")
+                    if not value:
+                        row_errors.append(f"position {sp.position_number}: empty value in sub-column '{desc['col_name']}'")
+                        sub_failed = True
+                        continue
+                    value = value.removeprefix("ID_").removesuffix("|")
+                    sub_item_id = core_lookup.get(desc["core_id"], {}).get(value)
+                    if not sub_item_id:
+                        row_errors.append(
+                            f"position {sp.position_number}: sub-column '{desc['col_name']}' value "
+                            f"'{value}' not found in the referenced Connect's Core"
+                        )
+                        sub_failed = True
+                    else:
+                        sub_resolved.append((desc["ref_pos"], sub_item_id))
+                if sub_failed:
+                    row_failed = True
+                    continue
+                ref_fp = "|".join(f"{pn}:{iid}" for pn, iid in sorted(sub_resolved, key=lambda x: x[0]))
+                ref_cdi_id = ref_fp_to_cdi.get(raw_descriptors[desc_idxs[0]]["ref_connect_id"], {}).get(ref_fp)
+                if not ref_cdi_id:
+                    row_errors.append(
+                        f"position {sp.position_number}: no active row in the referenced Connect "
+                        f"matches the combination ({' / '.join(sub_human)}). Make sure that row "
+                        "exists and is ACTIVE."
+                    )
+                    row_failed = True
+                else:
+                    resolved_positions.append((sp.position_number, None, ref_cdi_id))
 
         if row_failed:
             unresolved_count += 1
             unresolved_details.append({"row": row_num, "errors": row_errors})
             continue
 
+        # Match the shape produced by _make_fingerprint() / _position_value_id():
+        # connect_data_item_ref_id wins over core_data_item_id for CONNECT-type rows.
         row_fingerprint = "|".join(
-            f"{pos_num}:{item_id}"
-            for pos_num, item_id, _ in sorted(resolved_positions, key=lambda x: x[0])
+            f"{pos_num}:{ref_id or item_id}"
+            for pos_num, item_id, ref_id in sorted(resolved_positions, key=lambda x: x[0])
         )
         if row_fingerprint in existing_fingerprints:
             skipped_duplicates += 1
@@ -926,18 +1096,18 @@ async def upload_excel(
             "created_at": csv_ts or _utcnow(),
         })
 
-        for pos_num, item_id, _ in resolved_positions:
+        for pos_num, item_id, ref_id in resolved_positions:
             cdp_rows.append({
                 "connect_data_item_id": new_id,
                 "position_number": pos_num,
                 "core_data_item_id": item_id,
-                "connect_data_item_ref_id": None,
+                "connect_data_item_ref_id": ref_id,
             })
 
         sorted_pos = sorted(resolved_positions, key=lambda x: x[0])
         for j in range(len(sorted_pos) - 1):
-            from_pos_num, from_item_id, _ = sorted_pos[j]
-            to_pos_num, to_item_id, _ = sorted_pos[j + 1]
+            from_pos_num, from_item_id, _from_ref = sorted_pos[j]
+            to_pos_num, to_item_id, _to_ref = sorted_pos[j + 1]
             from_schema = schema_map_by_pos[from_pos_num]
             to_schema = schema_map_by_pos[to_pos_num]
             from_type = from_schema.node_type.value if hasattr(from_schema.node_type, 'value') else str(from_schema.node_type)
