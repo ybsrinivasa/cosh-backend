@@ -1,7 +1,17 @@
 # Cosh 2.0 — Production compose for local server (cosh2.eywa.farm)
 # Server: 10.12.10.115 (LAN) / 106.51.66.90:3860 (public via Cloudflare)
 # Layout: /data/cosh2.0Pro/cosh-backend (this) + /data/cosh2.0Pro/cosh-frontend
-# All app ports bound to 127.0.0.1 — system nginx (host) proxies to them.
+#
+# Networking note (2026-05-26): UFW on the prod host broke Docker bridge
+# outbound (FORWARD policy DROP, DOCKER chains empty, packets fell through to
+# UFW drop). `systemctl restart docker` did not fix it. As a durable workaround,
+# api / celery / celery-beat now use `network_mode: host` so they share the
+# host's working network namespace and can reach rstalkapi.eywa.farm, SMTP,
+# Anthropic, etc. Postgres / Redis / Neo4j / Indictrans publish their ports to
+# 127.0.0.1 so the host-networked services reach them via loopback. Frontend
+# stays on the bridge with an `extra_hosts: api -> host-gateway` mapping so
+# INTERNAL_API_URL=http://api:8000 keeps resolving.
+# See feedback_dockerignore_required.md memory for full diagnostic story.
 
 services:
 
@@ -16,8 +26,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - /data/cosh2.0Pro/db/postgres:/var/lib/postgresql/data
-    expose:
-      - "5432"
+    ports:
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -28,8 +38,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    expose:
-      - "6379"
+    ports:
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -48,19 +58,19 @@ services:
       - /data/cosh2.0Pro/db/neo4j/data:/data
       - /data/cosh2.0Pro/db/neo4j/logs:/logs
       - /data/cosh2.0Pro/db/neo4j/plugins:/plugins
-    expose:
-      - "7687"
-      - "7474"
+    ports:
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
 
   # ── FastAPI ─────────────────────────────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
     restart: unless-stopped
     env_file: .env
-    ports:
-      - "127.0.0.1:8000:8000"
+    network_mode: host
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,9 +89,10 @@ services:
     build:
       context: ./indictrans
       dockerfile: Dockerfile
+      network: host
     restart: unless-stopped
-    expose:
-      - "8001"
+    ports:
+      - "127.0.0.1:8001:8001"
     volumes:
       # Persist HuggingFace model cache so we don't re-download on rebuild.
       - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
@@ -97,9 +108,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
     command: celery -A app.celery_app worker --loglevel=info -Q translation,similarity,sync --concurrency=2
     restart: unless-stopped
     env_file: .env
+    network_mode: host
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,9 +124,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: host
     command: celery -A app.celery_app beat --loglevel=info
     restart: unless-stopped
     env_file: .env
+    network_mode: host
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,12 +140,6 @@ services:
     build:
       context: /data/cosh2.0Pro/cosh-frontend
       dockerfile: Dockerfile
-      # Use the host's network namespace ONLY during build so npm ci can
-      # reach registry.npmjs.org. Docker's bridge network on this host had
-      # broken outbound on 2026-05-26 (containers couldn't reach external
-      # HTTPS despite host having connectivity); a docker daemon restart is
-      # the cleaner fix, but this lets builds work even if the bridge stays
-      # broken. Runtime networking is unaffected — only the build phase.
       network: host
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
@@ -139,6 +148,10 @@ services:
       INTERNAL_API_URL: ${INTERNAL_API_URL}
     ports:
       - "127.0.0.1:3001:3000"
+    extra_hosts:
+      # api runs in host network mode; resolve "api" to the docker bridge
+      # gateway (host) so INTERNAL_API_URL=http://api:8000 keeps working.
+      - "api:host-gateway"
 
 networks:
   default:
