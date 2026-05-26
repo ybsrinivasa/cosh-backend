@@ -125,6 +125,13 @@ services:
     build:
       context: /data/cosh2.0Pro/cosh-frontend
       dockerfile: Dockerfile
+      # Use the host's network namespace ONLY during build so npm ci can
+      # reach registry.npmjs.org. Docker's bridge network on this host had
+      # broken outbound on 2026-05-26 (containers couldn't reach external
+      # HTTPS despite host having connectivity); a docker daemon restart is
+      # the cleaner fix, but this lets builds work even if the bridge stays
+      # broken. Runtime networking is unaffected — only the build phase.
+      network: host
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
     restart: unless-stopped
