@@ -539,7 +539,7 @@ async def upload_csv(
     headers = reader.fieldnames or []
     lang_cols = {}  # lang_code → (value_col, status_col)
     for h in headers:
-        if h.endswith("_value") and h != "english_value":
+        if h.endswith("_value") and h.lower() != "english_value":
             lang = h[:-6]  # strip "_value"
             if len(lang) <= 10:  # plausible language code
                 status_col = f"{lang}_validation_status"
