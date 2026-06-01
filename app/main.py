@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, admin_users, folders, cores, connects, similarity, sync, admin, public
+from app.routers import auth, admin_users, folders, cores, connects, similarity, sync, admin, public, visualization
 from app.config import settings
 
 app = FastAPI(title="Cosh 2.0 API", version="0.1.0")
@@ -24,6 +24,7 @@ app.include_router(similarity.router)
 app.include_router(sync.router)
 app.include_router(admin.router)
 app.include_router(public.router)
+app.include_router(visualization.router)
 
 
 @app.get("/")
