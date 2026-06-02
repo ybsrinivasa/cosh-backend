@@ -259,12 +259,13 @@ async def list_items(
         q = q.where(CoreDataItem.status == StatusEnum(status_filter))
     items = (await db.execute(q.order_by(CoreDataItem.english_value))).scalars().all()
 
-    # Resolve creator names in one batch query
-    user_ids = list({item.created_by for item in items if item.created_by})
+    # Resolve creator + last-editor names in one batch query
+    user_ids = {item.created_by for item in items if item.created_by}
+    user_ids |= {item.updated_by for item in items if item.updated_by}
     user_map: dict = {}
     if user_ids:
         users = (await db.execute(
-            select(User.id, User.name, User.email).where(User.id.in_(user_ids))
+            select(User.id, User.name, User.email).where(User.id.in_(list(user_ids)))
         )).all()
         user_map = {u.id: u.name or u.email for u in users}
 
@@ -289,6 +290,8 @@ async def list_items(
             "created_by_name": item.legacy_created_by_name or user_map.get(item.created_by),
             "s3_url": media_map.get(item.id),
             "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "updated_by_name": user_map.get(item.updated_by),
             "translations": item.translations,
         }
         for item in items
@@ -445,6 +448,7 @@ async def update_item(
         raise HTTPException(status_code=404, detail="Item not found in this Core")
 
     item.english_value = request.english_value
+    item.updated_by = current_user.id
     await dual_write_update_english(item_id, request.english_value)
 
     if core.core_type == CoreType.MEDIA and request.s3_url is not None:
@@ -486,6 +490,7 @@ async def update_item_status(
         raise HTTPException(status_code=404, detail="Item not found in this Core")
 
     item.status = request.status
+    item.updated_by = current_user.id
     cascaded = 0
     if request.status == StatusEnum.INACTIVE:
         cascaded = await inactivity_cascade(db, item_id)

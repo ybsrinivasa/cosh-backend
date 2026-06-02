@@ -96,6 +96,8 @@ class CoreDataItemOut(BaseModel):
     created_by_name: Optional[str] = None
     s3_url: Optional[str] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    updated_by_name: Optional[str] = None
     translations: List[TranslationOut] = []
 
     class Config:

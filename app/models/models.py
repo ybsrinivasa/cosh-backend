@@ -225,6 +225,7 @@ class CoreDataItem(Base):
     legacy_created_by_name: Mapped[str] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
 
     core: Mapped["Core"] = relationship("Core", back_populates="data_items")
     translations: Mapped[list["CoreDataTranslation"]] = relationship("CoreDataTranslation", back_populates="item")
@@ -329,6 +330,8 @@ class ConnectDataItem(Base):
     created_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     legacy_created_by_name: Mapped[str] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_by: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
 
     connect: Mapped["Connect"] = relationship("Connect", back_populates="data_items")
     positions: Mapped[list["ConnectDataPosition"]] = relationship(

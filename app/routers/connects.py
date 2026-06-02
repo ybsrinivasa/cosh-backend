@@ -404,11 +404,12 @@ async def list_connect_data_items(
         .order_by(ConnectDataItem.created_at)
     )).scalars().all()
 
-    user_ids = list({item.created_by for item in items if item.created_by})
+    user_ids = {item.created_by for item in items if item.created_by}
+    user_ids |= {item.updated_by for item in items if item.updated_by}
     user_map: dict = {}
     if user_ids:
         users = (await db.execute(
-            select(User.id, User.name, User.email).where(User.id.in_(user_ids))
+            select(User.id, User.name, User.email).where(User.id.in_(list(user_ids)))
         )).all()
         user_map = {u.id: u.name or u.email for u in users}
 
@@ -446,6 +447,8 @@ async def list_connect_data_items(
             "status": item.status,
             "created_by_name": item.legacy_created_by_name or user_map.get(item.created_by),
             "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "updated_by_name": user_map.get(item.updated_by),
             "positions": [_enrich_position(p) for p in item.positions],
         }
         for item in items
@@ -663,6 +666,7 @@ async def update_connect_data_item(
             connect_data_item_ref_id=pos.connect_data_item_ref_id,
         ))
 
+    cdi.updated_by = current_user.id  # updated_at auto-stamps via onupdate
     inactivate_neo4j_relationships(cdi_id)
     try:
         create_neo4j_relationships(cdi.id, connect_id, resolved, schema_positions)
@@ -702,6 +706,7 @@ async def update_connect_data_status(
         raise HTTPException(status_code=404, detail="Connect Data Item not found")
 
     cdi.status = request.status
+    cdi.updated_by = current_user.id
     if request.status == StatusEnum.INACTIVE:
         inactivate_neo4j_relationships(cdi_id)
         change = ChangeType.INACTIVATED
