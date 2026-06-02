@@ -33,6 +33,21 @@ class FilterOptionsOut(BaseModel):
     cores: list[CoreOption]
 
 
+# ── Connect filter options (Phase 3.2) ───────────────────────────────────────
+
+class ConnectOption(BaseModel):
+    """One entry in the Connect-mode dropdown. `position_count` lets the UI
+    flag multi-position Connects (which are the most interesting to show)."""
+    id: str
+    name: str
+    active_item_count: int
+    position_count: int
+
+
+class ConnectListOut(BaseModel):
+    connects: list[ConnectOption]
+
+
 # ── Search endpoint ──────────────────────────────────────────────────────────
 
 class SearchHit(BaseModel):
@@ -52,15 +67,21 @@ class VizNode(BaseModel):
     """A node in the rendered subgraph.
 
     `core_id` drives stable colouring on the frontend (one colour per Core).
-    `group` is a UI hint set to "filter1" or "filter2" so the renderer can
-    style the two slice sides differently (e.g., larger / glowing nodes
-    for the focal slice).
+    `group` is a UI hint — "filter1" for the focal/primary side, "filter2"
+    for the connected side. When Filter 2 is omitted, every neighbour is
+    tagged "filter2" so the renderer keeps the same visual differentiation.
+
+    `node_kind` lets the renderer distinguish ordinary Core items from
+    virtual "hub" nodes produced by /viz/connect-slice (one hub per
+    ConnectDataItem). Hubs use the Connect name as `core_name` so they
+    get their own palette slot.
     """
     id: str
     label: str
     core_id: str
     core_name: str
     group: Literal["filter1", "filter2"]
+    node_kind: Literal["item", "hub"] = "item"
 
 
 class VizEdge(BaseModel):
