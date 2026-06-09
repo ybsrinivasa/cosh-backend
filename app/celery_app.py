@@ -25,6 +25,12 @@ celery_app.conf.update(
         "app.tasks.similarity.*": {"queue": "similarity"},
         "app.tasks.sync.*": {"queue": "sync"},
     },
+    # Redis broker re-queues unacked tasks after visibility_timeout (default
+    # 1 hour). CPU IndicTrans2 can take 60-90 min on a multi-thousand-row
+    # Core — the default caused observed duplicate execution on 2026-06-09.
+    # 6 hours covers the worst long task while still being short enough that
+    # a genuinely dead worker doesn't park a task forever.
+    broker_transport_options={"visibility_timeout": 6 * 60 * 60},
     beat_schedule={
         "daily-similarity-scan": {
             "task": "app.tasks.similarity.detect_similarity_all_cores",

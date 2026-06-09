@@ -19,6 +19,13 @@ from app.services.transliteration_service import transliterate_text
 
 logger = logging.getLogger(__name__)
 
+# Number of new/changed translation rows between intermediate commits in
+# the bulk tasks. Keep small so progress is visible live in the DB and so
+# a worker crash mid-task only loses ~COMMIT_EVERY rows of work.
+# 50 rows × ~1.5 s/translation = ~75 s between commits — comfortable for
+# observability and well under the broker visibility_timeout.
+COMMIT_EVERY = 50
+
 
 def _get_sync_engine():
     import os
@@ -124,6 +131,9 @@ def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expe
     Re-process all items in a Core.
     overwrite_expert=False: skip EXPERT_VALIDATED (safe default).
     overwrite_expert=True: overwrite everything (requires Designer confirmation).
+
+    Commits every COMMIT_EVERY successful rows so progress is visible
+    live and a worker crash mid-task only loses ~COMMIT_EVERY rows.
     """
     from app.models.models import CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum
 
@@ -131,21 +141,29 @@ def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expe
 
     with Session(engine) as session:
         mode = _get_core_mode(session, core_id)
+        # Fetch as tuples — no ORM objects to worry about expiring on commit.
         items = session.execute(
-            select(CoreDataItem).where(
+            select(CoreDataItem.id, CoreDataItem.english_value).where(
                 CoreDataItem.core_id == core_id,
                 CoreDataItem.status == StatusEnum.ACTIVE,
             )
-        ).scalars().all()
+        ).all()
 
-        for item in items:
+        total_target = len(items) * len([l for l in target_langs if l != "en"])
+        processed = 0
+        logger.info(
+            f"[retranslate_core] core={core_id} mode={mode} "
+            f"items={len(items)} langs={target_langs} target={total_target}"
+        )
+
+        for item_id, english_value in items:
             for lang in target_langs:
                 if lang == "en":
                     continue
 
                 existing = session.execute(
                     select(CoreDataTranslation).where(
-                        CoreDataTranslation.item_id == item.id,
+                        CoreDataTranslation.item_id == item_id,
                         CoreDataTranslation.language_code == lang,
                     )
                 ).scalar_one_or_none()
@@ -153,30 +171,38 @@ def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expe
                 if existing and existing.validation_status == ValidationStatus.EXPERT_VALIDATED and not overwrite_expert:
                     continue
 
-                processed = _process_text(item.english_value, "en", lang, mode)
-                if not processed:
+                processed_text = _process_text(english_value, "en", lang, mode)
+                if not processed_text:
                     continue
 
                 if existing:
-                    existing.translated_value = processed
+                    existing.translated_value = processed_text
                     existing.validation_status = ValidationStatus.MACHINE_GENERATED
                 else:
                     session.add(CoreDataTranslation(
-                        item_id=item.id,
+                        item_id=item_id,
                         language_code=lang,
-                        translated_value=processed,
+                        translated_value=processed_text,
                         validation_status=ValidationStatus.MACHINE_GENERATED,
                     ))
+                processed += 1
+                if processed % COMMIT_EVERY == 0:
+                    session.commit()
+                    logger.info(
+                        f"[retranslate_core] core={core_id} progress "
+                        f"{processed}/{total_target}"
+                    )
 
+        # Final partial batch
         session.commit()
-    logger.info(f"Re-process complete for core {core_id} (mode={mode})")
+    logger.info(f"[retranslate_core] DONE core={core_id} mode={mode} processed={processed}")
 
 
 @celery_app.task(name="app.tasks.translation.translate_new_language_for_core", bind=True)
 def translate_new_language_for_core(self, core_id: str, language_code: str):
     """
     When a new language is added to a Core — process all existing active items
-    for that language only.
+    for that language only. Commits in batches like retranslate_core.
     """
     from app.models.models import CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum
 
@@ -185,16 +211,23 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
     with Session(engine) as session:
         mode = _get_core_mode(session, core_id)
         items = session.execute(
-            select(CoreDataItem).where(
+            select(CoreDataItem.id, CoreDataItem.english_value).where(
                 CoreDataItem.core_id == core_id,
                 CoreDataItem.status == StatusEnum.ACTIVE,
             )
-        ).scalars().all()
+        ).all()
 
-        for item in items:
+        total = len(items)
+        processed = 0
+        logger.info(
+            f"[translate_new_language_for_core] core={core_id} mode={mode} "
+            f"lang={language_code} items={total}"
+        )
+
+        for item_id, english_value in items:
             existing = session.execute(
                 select(CoreDataTranslation).where(
-                    CoreDataTranslation.item_id == item.id,
+                    CoreDataTranslation.item_id == item_id,
                     CoreDataTranslation.language_code == language_code,
                 )
             ).scalar_one_or_none()
@@ -202,14 +235,24 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
             if existing:
                 continue
 
-            processed = _process_text(item.english_value, "en", language_code, mode)
-            if processed:
+            processed_text = _process_text(english_value, "en", language_code, mode)
+            if processed_text:
                 session.add(CoreDataTranslation(
-                    item_id=item.id,
+                    item_id=item_id,
                     language_code=language_code,
-                    translated_value=processed,
+                    translated_value=processed_text,
                     validation_status=ValidationStatus.MACHINE_GENERATED,
                 ))
+                processed += 1
+                if processed % COMMIT_EVERY == 0:
+                    session.commit()
+                    logger.info(
+                        f"[translate_new_language_for_core] core={core_id} "
+                        f"lang={language_code} progress {processed}/{total}"
+                    )
 
         session.commit()
-    logger.info(f"New language [{language_code}] processed for core {core_id} (mode={mode})")
+    logger.info(
+        f"[translate_new_language_for_core] DONE core={core_id} "
+        f"lang={language_code} mode={mode} processed={processed}"
+    )
