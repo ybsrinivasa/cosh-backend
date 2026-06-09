@@ -13,14 +13,19 @@ Engine: ai4bharat-transliteration's XlitEngine, which wraps the
 underlying transformer model and handles per-language model loading
 + a beam-width search to pick the most likely transliteration.
 
-The first call to a language downloads its model (~50–80 MB each)
-and warms it in memory. We pre-load all 14 RootsTalk languages at
-startup so the first real request isn't a multi-minute wait.
+Lazy-loading: each language's transformer is ~300 MB in RAM once
+loaded. Pre-loading all 12 RootsTalk languages on this prod box
+(11 GB RAM, shared with api/postgres/neo4j/celery) caused repeated
+OOM-style crashes during startup. Instead we initialise an XlitEngine
+per language on first request and cache it. The first request for a
+given language pays ~10 s of model load; every subsequent request
+to the same language is fast. RAM grows only with the languages
+actually used — most production batches hit 1–3 languages.
 """
 import logging
 import os
-from contextlib import asynccontextmanager
-from typing import List
+import threading
+from typing import Dict, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -28,37 +33,39 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("indicxlit")
 
-# 13 Indic languages (English is the source; not transliterated to itself).
+# 12 Indic languages (English is the source; not transliterated to itself).
 # Matches the seeded set in scripts/seed_db.py exactly.
-DEFAULT_LANGS = ["hi", "bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "or", "ur", "as"]
-SUPPORTED_LANGS = set(DEFAULT_LANGS)
+SUPPORTED_LANGS = {"hi", "bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "or", "ur", "as"}
 
 BEAM_WIDTH = int(os.getenv("INDICXLIT_BEAM_WIDTH", "4"))
 
-state: dict = {}
+# One XlitEngine per language, cached lazily. The lock serialises the
+# load step (two concurrent first-requests for the same language would
+# otherwise both try to initialise the engine).
+_engines: Dict[str, object] = {}
+_engine_lock = threading.Lock()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Imported lazily so module import doesn't bring torch into scope before
-    # uvicorn has logging configured.
-    from ai4bharat.transliteration import XlitEngine
+def _get_engine(lang: str):
+    """Return an XlitEngine for `lang`, loading on first use."""
+    eng = _engines.get(lang)
+    if eng is not None:
+        return eng
+    with _engine_lock:
+        # Re-check inside the lock in case another request raced us.
+        eng = _engines.get(lang)
+        if eng is not None:
+            return eng
+        # Lazy import — keeps torch out of module-import scope.
+        from ai4bharat.transliteration import XlitEngine
+        logger.info(f"Loading XlitEngine for {lang!r} (beam_width={BEAM_WIDTH})…")
+        eng = XlitEngine(lang, beam_width=BEAM_WIDTH, src_script_type="en")
+        _engines[lang] = eng
+        logger.info(f"XlitEngine[{lang}] ready ({len(_engines)} language(s) cached).")
+        return eng
 
-    logger.info(f"Loading XlitEngine for {len(DEFAULT_LANGS)} languages "
-                f"(beam_width={BEAM_WIDTH})…")
-    # `src_script_type='en'` lets the engine accept ASCII input and emit
-    # the target Indic script. Passing all languages up-front means
-    # subsequent requests don't pay the cold-start cost.
-    state["engine"] = XlitEngine(
-        DEFAULT_LANGS,
-        beam_width=BEAM_WIDTH,
-        src_script_type="en",
-    )
-    logger.info("XlitEngine ready.")
-    yield
 
-
-app = FastAPI(lifespan=lifespan, title="IndicXlit Wrapper")
+app = FastAPI(title="IndicXlit Wrapper")
 
 
 class TransliterateRequest(BaseModel):
@@ -73,18 +80,19 @@ class TransliterateResponse(BaseModel):
 
 @app.get("/health")
 def health():
+    # The service is "ready" the moment the process is alive — actual
+    # engine loading is per-language and on-demand. Listing the cached
+    # set helps observability.
     return {
         "status": "ok",
-        "engine_loaded": "engine" in state,
-        "languages": sorted(SUPPORTED_LANGS),
+        "supported_languages": sorted(SUPPORTED_LANGS),
+        "loaded_languages": sorted(_engines.keys()),
         "beam_width": BEAM_WIDTH,
     }
 
 
 @app.post("/transliterate", response_model=TransliterateResponse)
 def transliterate(req: TransliterateRequest):
-    if "engine" not in state:
-        raise HTTPException(status_code=503, detail="Engine still loading")
     if not req.sentences:
         return TransliterateResponse(transliterations=[])
     if req.target_language not in SUPPORTED_LANGS:
@@ -99,13 +107,18 @@ def transliterate(req: TransliterateRequest):
             detail="Only English source is supported at present.",
         )
 
-    engine = state["engine"]
+    try:
+        engine = _get_engine(req.target_language)
+    except Exception as e:
+        logger.exception(f"Failed to load engine for {req.target_language}: {e}")
+        raise HTTPException(status_code=503, detail=f"Engine load failed: {e}")
+
     out: List[str] = []
     for sentence in req.sentences:
-        # XlitEngine.translit_sentence returns the top-beam result for a
-        # full sentence — handles whitespace, punctuation, and per-word
-        # transliteration internally. Falls back to the input as-is if
-        # nothing can be transliterated, which is the safe default.
+        # translit_sentence returns the top-beam result for a full
+        # sentence — handles whitespace, punctuation, and per-word
+        # transliteration internally. Falls back to input on any error
+        # so a bad sentence doesn't kill the whole batch.
         try:
             result = engine.translit_sentence(sentence, lang_code=req.target_language)
         except Exception as e:
