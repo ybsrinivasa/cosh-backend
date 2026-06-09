@@ -85,14 +85,18 @@ services:
       retries: 3
 
   # ── IndicTrans2 (background translation) ───────────────────────────────────
+  # `network_mode: host` (not just build-time) — required on this prod box
+  # because UFW's FORWARD DROP policy breaks docker bridge outbound, which
+  # then breaks the HuggingFace model download at startup. Host networking
+  # also gives celery (also host-net) a 127.0.0.1:8001 reach into this
+  # service. UFW handles external port lockdown.
   indictrans:
     build:
       context: ./indictrans
       dockerfile: Dockerfile
       network: host
+    network_mode: host
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8001:8001"
     volumes:
       # Persist HuggingFace model cache so we don't re-download on rebuild.
       - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
@@ -106,14 +110,14 @@ services:
   # ── IndicXlit (background transliteration) ─────────────────────────────────
   # Used for Cores whose language_mode == TRANSLITERATION (brand names,
   # chemical names — preserves the *sound*, not the meaning, across scripts).
+  # Same host-net rationale as indictrans above.
   indicxlit:
     build:
       context: ./indicxlit
       dockerfile: Dockerfile
       network: host
+    network_mode: host
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8002:8002"
     volumes:
       # Persist HuggingFace + AI4Bharat model caches.
       - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
