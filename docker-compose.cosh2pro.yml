@@ -97,6 +97,9 @@ services:
       network: host
     network_mode: host
     restart: unless-stopped
+    # .env carries HF_TOKEN (for the gated ai4bharat/indictrans2-* repo)
+    # plus optional INDICTRANS_MODEL / INDICTRANS_MAX_LENGTH overrides.
+    env_file: .env
     volumes:
       # Persist HuggingFace model cache so we don't re-download on rebuild.
       - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
@@ -118,6 +121,8 @@ services:
       network: host
     network_mode: host
     restart: unless-stopped
+    # .env carries optional INDICXLIT_BEAM_WIDTH override.
+    env_file: .env
     volumes:
       # Persist HuggingFace + AI4Bharat model caches.
       - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
