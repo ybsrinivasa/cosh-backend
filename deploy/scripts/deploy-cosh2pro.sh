@@ -57,8 +57,12 @@ echo ">> Pulling latest frontend..."
 git -C "$FRONTEND_DIR" pull origin main
 
 # ── 3. Build images ──────────────────────────────────────────────────────────
+# indictrans + indicxlit are intentionally built here too. First build of
+# either pulls multi-hundred-MB model wheels (torch + transformers + AI4Bharat
+# models), so allow 15–30 min for an initial cold build. Subsequent builds
+# are fast — only the Python source layer is re-baked.
 echo ">> Building images..."
-$COMPOSE build api celery celery-beat frontend
+$COMPOSE build api celery celery-beat frontend indictrans indicxlit
 
 # ── 4. Start infrastructure ──────────────────────────────────────────────────
 echo ">> Starting postgres, redis, neo4j..."
@@ -80,8 +84,8 @@ if [ -f scripts/seed_db.py ]; then
 fi
 
 # ── 6. Start app services ────────────────────────────────────────────────────
-echo ">> Restarting API, Celery, frontend..."
-$COMPOSE up -d --force-recreate api celery celery-beat frontend
+echo ">> Restarting API, Celery, frontend, IndicTrans2, IndicXlit..."
+$COMPOSE up -d --force-recreate api celery celery-beat frontend indictrans indicxlit
 
 # ── 7. Cleanup ───────────────────────────────────────────────────────────────
 echo ">> Pruning old images..."
@@ -93,6 +97,11 @@ echo ">> Waiting 10s for services to settle..."
 sleep 10
 echo "API health (origin):  $(curl -fsS http://127.0.0.1:8000/health 2>&1 | head -c 200)"
 echo "Origin via nginx:     $(curl -fsS http://127.0.0.1:3860/health 2>&1 | head -c 200)"
+# Translation engines warm up slowly on first start (model download +
+# model load can run for several minutes). A 503 here just means
+# "still loading" — re-check via `curl 127.0.0.1:8001/health` later.
+echo "IndicTrans2 health:   $(curl -fsS http://127.0.0.1:8001/health 2>&1 | head -c 200)"
+echo "IndicXlit health:     $(curl -fsS http://127.0.0.1:8002/health 2>&1 | head -c 200)"
 
 echo ""
 echo "=== Deploy complete ==="

@@ -103,6 +103,28 @@ services:
       start_period: 180s
       retries: 3
 
+  # ── IndicXlit (background transliteration) ─────────────────────────────────
+  # Used for Cores whose language_mode == TRANSLITERATION (brand names,
+  # chemical names — preserves the *sound*, not the meaning, across scripts).
+  indicxlit:
+    build:
+      context: ./indicxlit
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8002"
+    volumes:
+      # Persist HuggingFace + AI4Bharat model caches.
+      - /data/cosh2.0Pro/models/huggingface:/root/.cache/huggingface
+      - /data/cosh2.0Pro/models/ai4bharat:/root/.AI4Bharat
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+
   # ── Celery worker ───────────────────────────────────────────────────────────
   celery:
     build:
