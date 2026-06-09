@@ -1,4 +1,9 @@
-FROM python:3.11-slim
+# ai4bharat-transliteration pulls fairseq, which uses mutable
+# defaults in dataclasses (`CommonConfig(common=…)`). Python 3.11
+# rejects that pattern at import time — observed live on prod as
+# "mutable default … for field common is not allowed: use
+# default_factory". Pinning to 3.10 dodges the issue cleanly.
+FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
