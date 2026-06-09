@@ -20,6 +20,9 @@ def call_indicxlit(text: str, source_lang: str, target_lang: str) -> str | None:
 
     try:
         import httpx
+        # Same reasoning as translation_service: IndicXlit serializes on CPU
+        # and a longer phrase under concurrent load can take 30-60 s. 120 s
+        # leaves headroom for the worst case.
         response = httpx.post(
             f"{api_url}/transliterate",
             json={
@@ -27,7 +30,7 @@ def call_indicxlit(text: str, source_lang: str, target_lang: str) -> str | None:
                 "target_language": target_lang,
                 "sentences": [text],
             },
-            timeout=30.0,
+            timeout=120.0,
         )
         if response.status_code == 200:
             data = response.json()

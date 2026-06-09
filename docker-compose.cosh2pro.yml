@@ -135,12 +135,32 @@ services:
       retries: 3
 
   # ── Celery worker ───────────────────────────────────────────────────────────
+  # IndicTrans2 + IndicXlit are single-process CPU-bound inference engines —
+  # parallel callers serialise inside the engine, so the only thing
+  # concurrency>1 on the translation queue achieves is timeouts. Translation
+  # is its own worker at concurrency=1; similarity + sync stay on a separate
+  # worker at concurrency=2 so they aren't starved by long translation jobs.
   celery:
     build:
       context: .
       dockerfile: Dockerfile
       network: host
-    command: celery -A app.celery_app worker --loglevel=info -Q translation,similarity,sync --concurrency=2
+    command: celery -A app.celery_app worker --loglevel=info -Q translation --concurrency=1 -n translation@%h
+    restart: unless-stopped
+    env_file: .env
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-other:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    command: celery -A app.celery_app worker --loglevel=info -Q similarity,sync --concurrency=2 -n other@%h
     restart: unless-stopped
     env_file: .env
     network_mode: host

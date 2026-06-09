@@ -22,6 +22,12 @@ def call_indictrans2(text: str, source_lang: str, target_lang: str) -> str | Non
 
     try:
         import httpx
+        # CPU IndicTrans2 serializes inference (one beam search at a time).
+        # When two celery workers share the engine, a single translation
+        # can wait through another worker's job and itself take 30-60s on
+        # longer multi-word phrases. 120s leaves headroom for the worst
+        # cases observed live so we never spuriously fall through to the
+        # Google fallback.
         response = httpx.post(
             f"{api_url}/translate",
             json={
@@ -29,7 +35,7 @@ def call_indictrans2(text: str, source_lang: str, target_lang: str) -> str | Non
                 "target_language": target_lang,
                 "sentences": [text],
             },
-            timeout=30.0,
+            timeout=120.0,
         )
         if response.status_code == 200:
             data = response.json()
