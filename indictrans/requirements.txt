@@ -1,4 +1,9 @@
-transformers>=4.45,<5
+# transformers 4.45 changed past_key_values from tuple-of-tuples to a
+# DynamicCache object. IndicTrans2's custom modeling.py still indexes
+# past_key_values[0][0].shape — which raises AttributeError on a Cache.
+# Pin to a known-good pre-4.45 range until AI4Bharat updates the model.
+# Observed live on prod 2026-06-09.
+transformers>=4.40,<4.45
 sentencepiece>=0.2.0
 IndicTransToolkit>=1.0.3
 fastapi>=0.115
