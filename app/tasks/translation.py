@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.services.translation_service import translate_text
 from app.services.transliteration_service import transliterate_text
+from app.services.claude_translation_service import claude_translate
 
 logger = logging.getLogger(__name__)
 
@@ -35,24 +36,52 @@ def _get_sync_engine():
     return create_engine(url)
 
 
-def _process_text(text: str, source_lang: str, target_lang: str, mode) -> str | None:
+def _process_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    mode,
+    core_name: str | None = None,
+    core_description: str | None = None,
+) -> str | None:
     """Route to the right engine based on the Core's language_mode.
 
     `mode` is a LanguageMode enum value or None. None defaults to
     TRANSLATION so existing Cores keep their current behaviour.
+
+    TRANSLATION mode:
+      Claude (domain-aware, sees core_name + core_description) → IndicTrans2 fallback
+      → Google Translate fallback. Most calls land on Claude.
+
+    TRANSLITERATION mode:
+      IndicXlit only — sound-preserving brand/chemical names, no benefit
+      from LLM context.
     """
     from app.models.models import LanguageMode
     if mode == LanguageMode.TRANSLITERATION:
         return transliterate_text(text, source_lang, target_lang)
+    # TRANSLATION (or NULL): try Claude first with Core context.
+    out = claude_translate(text, source_lang, target_lang, core_name, core_description)
+    if out:
+        return out
+    # Fallback: original IndicTrans2/Google chain.
     return translate_text(text, source_lang, target_lang)
 
 
-def _get_core_mode(session: Session, core_id: str):
-    """Look up the Core's language_mode. Returns None if not found
-    (caller treats None as "use translation")."""
+def _get_core_context(session: Session, core_id: str):
+    """Load (mode, name, description) for the parent Core in one query.
+    Returns (None, None, None) if not found (caller treats mode=None as TRANSLATION)."""
     from app.models.models import Core
     core = session.execute(select(Core).where(Core.id == core_id)).scalar_one_or_none()
-    return core.language_mode if core else None
+    if not core:
+        return None, None, None
+    return core.language_mode, core.name, core.description
+
+
+# Kept for backwards compat where only mode is needed.
+def _get_core_mode(session: Session, core_id: str):
+    mode, _, _ = _get_core_context(session, core_id)
+    return mode
 
 
 @celery_app.task(name="app.tasks.translation.translate_item", bind=True, max_retries=3)
@@ -76,7 +105,7 @@ def translate_item(self, item_id: str, english_value: str, target_langs: list[st
         if not item_row:
             logger.warning(f"translate_item: item {item_id} not found")
             return
-        mode = _get_core_mode(session, item_row.core_id)
+        mode, core_name, core_description = _get_core_context(session, item_row.core_id)
 
         for lang in target_langs:
             if lang == "en":
@@ -93,7 +122,7 @@ def translate_item(self, item_id: str, english_value: str, target_langs: list[st
                 logger.info(f"Skipping EXPERT_VALIDATED translation [{lang}] for item {item_id}")
                 continue
 
-            processed = _process_text(english_value, "en", lang, mode)
+            processed = _process_text(english_value, "en", lang, mode, core_name, core_description)
             if not processed:
                 continue
 
@@ -140,7 +169,7 @@ def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expe
     engine = _get_sync_engine()
 
     with Session(engine) as session:
-        mode = _get_core_mode(session, core_id)
+        mode, core_name, core_description = _get_core_context(session, core_id)
         # Fetch as tuples — no ORM objects to worry about expiring on commit.
         items = session.execute(
             select(CoreDataItem.id, CoreDataItem.english_value).where(
@@ -152,7 +181,7 @@ def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expe
         total_target = len(items) * len([l for l in target_langs if l != "en"])
         processed = 0
         logger.info(
-            f"[retranslate_core] core={core_id} mode={mode} "
+            f"[retranslate_core] core={core_id} name={core_name!r} mode={mode} "
             f"items={len(items)} langs={target_langs} target={total_target}"
         )
 
@@ -171,7 +200,7 @@ def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expe
                 if existing and existing.validation_status == ValidationStatus.EXPERT_VALIDATED and not overwrite_expert:
                     continue
 
-                processed_text = _process_text(english_value, "en", lang, mode)
+                processed_text = _process_text(english_value, "en", lang, mode, core_name, core_description)
                 if not processed_text:
                     continue
 
@@ -209,7 +238,7 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
     engine = _get_sync_engine()
 
     with Session(engine) as session:
-        mode = _get_core_mode(session, core_id)
+        mode, core_name, core_description = _get_core_context(session, core_id)
         items = session.execute(
             select(CoreDataItem.id, CoreDataItem.english_value).where(
                 CoreDataItem.core_id == core_id,
@@ -220,7 +249,7 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
         total = len(items)
         processed = 0
         logger.info(
-            f"[translate_new_language_for_core] core={core_id} mode={mode} "
+            f"[translate_new_language_for_core] core={core_id} name={core_name!r} mode={mode} "
             f"lang={language_code} items={total}"
         )
 
@@ -235,7 +264,7 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
             if existing:
                 continue
 
-            processed_text = _process_text(english_value, "en", language_code, mode)
+            processed_text = _process_text(english_value, "en", language_code, mode, core_name, core_description)
             if processed_text:
                 session.add(CoreDataTranslation(
                     item_id=item_id,
