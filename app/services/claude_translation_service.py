@@ -42,6 +42,37 @@ LANG_NAMES = {
 }
 
 
+# Language-specific gold-standard term mappings. These are inserted into the
+# prompt only for the matching target_lang so we don't leak Kannada examples
+# into a Hindi call. Calibrated by native-speaking domain experts as feedback
+# arrives. When other languages are calibrated, add a sibling dict for them.
+# (V2 follow-up: move these to a DB-backed per-Core glossary so non-engineers
+# can maintain them.)
+TERM_HINTS = {
+    "kn": [
+        # crop names (kitchen vs field/grain distinction matters)
+        "Rice / Paddy → ಭತ್ತ  (NOT ಅಕ್ಕಿ — that's the cooked-rice term)",
+        "Mango → ಮಾವು  (and ಮಾವಿನ in the genitive when it modifies a following noun)",
+        "Bitter Gourd → ಹಾಗಲಕಾಯಿ",
+        "Bottle Gourd → ಸೋರೆಕಾಯಿ",
+        "Ash Gourd → ಬೂದು ಕುಂಬಳ",
+        "Brinjal → ಬದನೆ",
+        # pests
+        "Hopper → ಜಿಗಿ ಹುಳು  (NOT ಹಾಪರ್)",
+        "Brown Plant Hopper → ಕಂದು ಜಿಗಿ ಹುಳು",
+        "Beetle → ಜೀರುಂಡೆ  (NOT ಬಿಟಲ್)",
+        "Fruit Fly → ಹಣ್ಣಿನ ನೊಣ",
+        "Shoot and Fruit Borer → ಚಿಗುರು ಮತ್ತು ಕಾಯಿ ಕೊರಕ",
+        # diseases
+        "Blast → ಬೆಂಕಿ ರೋಗ  (the 'fire disease' term used in books; NOT a literal translation)",
+        "Powdery Mildew → ಬೂದು ರೋಗ  (NOT ಪೌಡರಿ ಮಿಲ್ಡ್ಯೂ)",
+        "Early Blight → ಅಗ್ರ ಅಂಗಮಾರಿ  (blights are 'Angamari' in Kannada)",
+    ],
+    # Other languages — calibrate similarly with help from a native-speaking
+    # field expert before running full batches.
+}
+
+
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 # Sonnet 4.6 was confirmed by a native-Kannada-speaking domain expert as
@@ -87,14 +118,19 @@ def _build_prompt(text: str, target_lang: str, core_name: Optional[str], core_de
         "",
         f"- **Default to the native {target_name} agricultural term** for crops, common "
         "pests, common diseases, deficiencies, and nutrient names. Books and "
-        "extension publications almost always have a settled term for these. Examples "
-        "of the kind of native terms that books use (Kannada examples; analogous "
-        "exist in every Indic language):",
-        "    • Hopper → ಜಿಗಿ ಹುಳು  (NOT ಹಾಪರ್)",
-        "    • Powdery Mildew → ಬೂದು ರೋಗ  (NOT ಪೌಡರಿ ಮಿಲ್ಡ್ಯೂ)",
-        "    • Beetle → ಜೀರುಂಡೆ  (NOT ಬಿಟಲ್)",
-        "    • Brown Plant Hopper → ಕಂದು ಜಿಗಿ ಹುಳು",
-        "    • Rice/Paddy → ಭತ್ತ  (the field/grain term, NOT ಅಕ್ಕಿ the kitchen term)",
+        "extension publications almost always have a settled term for these.",
+    ])
+    hints = TERM_HINTS.get(target_lang)
+    if hints:
+        parts.extend([
+            "",
+            f"  Verified gold-standard {target_name} mappings — use these EXACTLY "
+            f"when these English terms appear (calibrated by a native-speaking "
+            f"agricultural domain expert):",
+        ])
+        for h in hints:
+            parts.append(f"    • {h}")
+    parts.extend([
         "",
         "- **Transliterate ONLY when there is genuinely no settled native term** in "
         "agricultural literature. Use transliteration for things like:",
