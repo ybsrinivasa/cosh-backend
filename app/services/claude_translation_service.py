@@ -61,13 +61,17 @@ TERM_HINTS = {
         "Hopper → ಜಿಗಿ ಹುಳು  (NOT ಹಾಪರ್)",
         "Brown Plant Hopper → ಕಂದು ಜಿಗಿ ಹುಳು",
         "Beetle → ಜೀರುಂಡೆ  (NOT ಬಿಟಲ್)",
+        "Hadda Beetle → ಹಡ್ಡ ಜೀರುಂಡೆ  (keep the 'Hadda' qualifier — it identifies the species)",
         "Fruit Fly → ಹಣ್ಣಿನ ನೊಣ",
         "Aphid → ಸಸಿ ಹೇನು  (NOT ಜಿಗಟು ಹುಳು — that's not the standard book term)",
+        "Leaf Miner → ರಂಗೋಲಿ ಹುಳು  (named after rangoli — the curving trail it leaves on the leaf; NOT 'leaf-eating worm')",
+        "Mite → ನುಸಿ  (NOT the transliteration ಮಿಟೆ)",
         "Shoot and Fruit Borer → ಚಿಗುರು ಮತ್ತು ಕಾಯಿ ಕೊರಕ",
         # diseases
         "Blast → ಬೆಂಕಿ ರೋಗ  (the 'fire disease' term used in books; NOT a literal translation)",
-        "Powdery Mildew → ಬೂದು ರೋಗ  (NOT ಪೌಡರಿ ಮಿಲ್ಡ್ಯೂ)",
+        "Powdery Mildew → ಬೂದಿ ರೋಗ  (NOT ಪೌಡರಿ ಮಿಲ್ಡ್ಯೂ — and 'ಬೂದಿ' = ash, not 'ಬೂದು' = grey)",
         "Early Blight → ಅಗ್ರ ಅಂಗಮಾರಿ  (blights are 'Angamari' in Kannada)",
+        "Mosaic Disease → ಮೊಸೇಕ್ ನಂಜು ರೋಗ  ('Nanju' = virus/poison; transliterate Mosaic, native term for the rest)",
     ],
     # Hindi: sourced primarily from CSTT (Commission for Scientific and
     # Technical Terminology, Ministry of Education) — "Fundamental Glossary
