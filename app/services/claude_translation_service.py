@@ -84,19 +84,39 @@ def _build_prompt(text: str, target_lang: str, core_name: Optional[str], core_de
         "Register rules (very important — this is NOT general translation):",
         f"- Write the term EXACTLY as a {target_name} agricultural book, extension "
         "bulletin, or field-officer article would write it.",
-        f"- For crop names, use the regional {target_name} name that farmers actually "
-        "use (e.g. for paddy, write the field/grain term — ಭತ್ತ in Kannada — not the "
-        "kitchen term ಅಕ್ಕಿ).",
-        "- For pests, diseases, deficiencies, and nutrients, use whichever form books "
-        "and bulletins actually use. That may be a native term, or a transliteration "
-        "of the English technical term — books transliterate freely for terms like "
-        "'Early Blight', 'Powdery Mildew', 'Hopper', 'Beetle' — follow that convention "
-        "instead of inventing literary or Sanskrit synonyms nobody reads.",
+        "",
+        f"- **Default to the native {target_name} agricultural term** for crops, common "
+        "pests, common diseases, deficiencies, and nutrient names. Books and "
+        "extension publications almost always have a settled term for these. Examples "
+        "of the kind of native terms that books use (Kannada examples; analogous "
+        "exist in every Indic language):",
+        "    • Hopper → ಜಿಗಿ ಹುಳು  (NOT ಹಾಪರ್)",
+        "    • Powdery Mildew → ಬೂದು ರೋಗ  (NOT ಪೌಡರಿ ಮಿಲ್ಡ್ಯೂ)",
+        "    • Beetle → ಜೀರುಂಡೆ  (NOT ಬಿಟಲ್)",
+        "    • Brown Plant Hopper → ಕಂದು ಜಿಗಿ ಹುಳು",
+        "    • Rice/Paddy → ಭತ್ತ  (the field/grain term, NOT ಅಕ್ಕಿ the kitchen term)",
+        "",
+        "- **Transliterate ONLY when there is genuinely no settled native term** in "
+        "agricultural literature. Use transliteration for things like:",
+        "    • Specific chemical/pesticide names (Mancozeb, Carbendazim, Imidacloprid)",
+        "    • Specific brand names",
+        "    • Modern technical jargon, virus codes (TYLCV, etc.)",
+        "    • A handful of recently-borrowed terms where books themselves transliterate",
+        "",
+        f"- If unsure whether a settled native {target_name} term exists, choose the "
+        "native term. The downside of a slightly less-common native word is small; "
+        "the downside of an unnecessary transliteration is large (it makes the data "
+        "feel foreign).",
+        "",
         "- Do NOT produce poetic, literary, or Sanskrit-leaning renderings.",
-        "- Compound inputs ('Crop - Pest/Disease'): translate each part by the rules "
+        "- Compound inputs ('Crop - Pest/Disease'): render each part by the rules "
         "above and keep the same separator (hyphen, slash, etc.) in the same place.",
-        "- Be CONSISTENT: the same crop must always be rendered the same way across "
-        "rows, whether it appears alone or in a 'Crop - X' compound.",
+        f"  When a crop modifies a pest/disease in a compound, use the grammatically "
+        f"correct form for the language (e.g. in Kannada, ಮಾವು is the noun but ಮಾವಿನ "
+        f"is the form that modifies a following noun like ಜಿಗಿ ಹುಳು).",
+        "- Be CONSISTENT: the same crop name must always be rendered the same way "
+        "across rows, whether it appears alone or as the modifier in a 'Crop - X' "
+        "compound (allowing for the grammatical case shift just described).",
         "",
         f"English label to render in {target_name}: {text}",
         "",
