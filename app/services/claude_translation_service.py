@@ -66,6 +66,7 @@ TERM_HINTS = {
         "Aphid → ಸಸಿ ಹೇನು  (NOT ಜಿಗಟು ಹುಳು — that's not the standard book term)",
         "Leaf Miner → ರಂಗೋಲಿ ಹುಳು  (named after rangoli — the curving trail it leaves on the leaf; NOT 'leaf-eating worm')",
         "Mite → ನುಸಿ  (NOT the transliteration ಮಿಟೆ)",
+        "Nematode → ಜಂತು ಹುಳು  (NOT the transliteration ನೆಮಟೋಡ್)",
         "Shoot and Fruit Borer → ಚಿಗುರು ಮತ್ತು ಕಾಯಿ ಕೊರಕ",
         # diseases
         "Blast → ಬೆಂಕಿ ರೋಗ  (the 'fire disease' term used in books; NOT a literal translation)",
