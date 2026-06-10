@@ -349,32 +349,58 @@ def claude_translate(
     if not api_key:
         return None
 
+    import time
     try:
         import httpx
         prompt = _build_prompt(text, target_lang, core_name, core_description)
-        response = httpx.post(
-            ANTHROPIC_API_URL,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
-            },
-            json={
-                "model": DEFAULT_MODEL,
-                # Short labels — 80 tokens covers even longer Indic compounds with
-                # script overhead. Capping low also blocks the "let me reconsider…"
-                # rambling pattern observed on uncertain agricultural terms.
-                # (The Anthropic API rejects whitespace-only stop_sequences,
-                # so we enforce single-line at parse time below instead.)
-                "max_tokens": 80,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60.0,
-        )
-        if response.status_code != 200:
+        # Retry on 429 (rate limit). Worker concurrency=1 plus a tier-1
+        # Anthropic key (30k input tokens/min on Sonnet) is enough to
+        # exceed the limit when batching short labels. When we hit 429 we
+        # honour the `retry-after` header from Anthropic if present,
+        # otherwise back off exponentially. 5 attempts × max ~40 s ≈
+        # ~2 min worst case per item — acceptable; the worker is async
+        # from the user's perspective anyway.
+        MAX_RETRIES = 5
+        BACKOFF = [3, 6, 12, 24, 40]
+        response = None
+        for attempt in range(MAX_RETRIES):
+            response = httpx.post(
+                ANTHROPIC_API_URL,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": DEFAULT_MODEL,
+                    # Short labels — 80 tokens covers even longer Indic compounds
+                    # with script overhead. Capping low also blocks the "let me
+                    # reconsider…" rambling pattern observed on uncertain
+                    # agricultural terms. (The Anthropic API rejects
+                    # whitespace-only stop_sequences, so we enforce single-line
+                    # at parse time below instead.)
+                    "max_tokens": 80,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60.0,
+            )
+            if response.status_code != 429:
+                break
+            # Rate-limited. Sleep then retry.
+            retry_after = response.headers.get("retry-after")
+            try:
+                wait = int(retry_after) if retry_after else BACKOFF[attempt]
+            except ValueError:
+                wait = BACKOFF[attempt]
             logger.warning(
-                f"Claude API HTTP {response.status_code} for lang={target_lang}: "
-                f"{response.text[:200]}"
+                f"Claude 429 (rate limit) for lang={target_lang}; "
+                f"backing off {wait}s [attempt {attempt + 1}/{MAX_RETRIES}]"
+            )
+            time.sleep(wait)
+        if response is None or response.status_code != 200:
+            logger.warning(
+                f"Claude API HTTP {response.status_code if response else '?'} for "
+                f"lang={target_lang}: {response.text[:200] if response else '(no response)'}"
             )
             return None
         data = response.json()
