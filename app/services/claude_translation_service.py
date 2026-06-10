@@ -76,8 +76,11 @@ def _build_prompt(text: str, target_lang: str, core_name: Optional[str], core_de
         "",
         f"Source: {text}",
         "",
-        f"Reply with ONLY the {target_name} translation. No quotes, no explanation, "
-        f"no preamble.",
+        "Output rules — strict:",
+        f"- Reply with ONE single line: the {target_name} translation only.",
+        "- Do NOT include quotes, backticks, explanations, alternatives, parentheticals, "
+        "or English. Do NOT 'reconsider'. Do NOT add a second attempt.",
+        f"- If you are unsure, give your single best {target_name} answer in one line and stop.",
     ])
     return "\n".join(parts)
 
@@ -112,7 +115,12 @@ def claude_translate(
             },
             json={
                 "model": DEFAULT_MODEL,
-                "max_tokens": 256,
+                # Short labels — 80 tokens covers even longer Indic compounds with
+                # script overhead. Capping low also blocks the "let me reconsider…"
+                # rambling pattern observed on uncertain agricultural terms.
+                "max_tokens": 80,
+                # First newline ends the answer — the prompt requires single-line output.
+                "stop_sequences": ["\n"],
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60.0,
