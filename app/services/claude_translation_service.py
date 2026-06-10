@@ -44,43 +44,68 @@ LANG_NAMES = {
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-# Haiku 4.5 is fast (~1 s per call), cheap (~$0.0003/call), and good enough
-# for short structured agricultural labels. Override with CLAUDE_MODEL if
-# you want to A/B against Sonnet on a harder Core.
-DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+# Sonnet 4.6 was confirmed by a native-Kannada-speaking domain expert as
+# producing the right register — terms that appear in agricultural books
+# and university extension publications, not literary/Sanskrit synonyms,
+# and English transliterations where books actually transliterate
+# ("Early Blight" → "ಅರ್ಲಿ ಬ್ಲೈಟ್"). Haiku failed this test (e.g. translated
+# Rice as ಅಕ್ಕಿ — cooked rice — instead of ಭತ್ತ paddy). Do not lower the
+# model tier without re-running the comparison.
+DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 
 def _build_prompt(text: str, target_lang: str, core_name: Optional[str], core_description: Optional[str]) -> str:
-    """Construct the user message for a single short-label translation."""
+    """Construct the user message for a single short-label translation.
+
+    The prompt is deliberately oriented around the *register* of Indian
+    agricultural literature (university extension publications, state
+    department of agriculture bulletins, ICAR / UAS / TNAU / KAU
+    handbooks) rather than abstract "translation". A native Kannada
+    domain expert verified that this framing produces the terminology
+    farmers and field experts actually read and use — and that includes
+    transliteration of English technical terms when books transliterate
+    them ("Early Blight" → "ಅರ್ಲಿ ಬ್ಲೈಟ್", not invented synonyms).
+    """
     target_name = LANG_NAMES.get(target_lang, target_lang)
     parts = [
-        f"You are translating one short data label from English to {target_name} "
-        f"for an Indian agricultural knowledge graph (Cosh).",
+        f"You are writing one cell in a {target_name} agricultural reference "
+        f"publication — the kind produced by Indian agricultural universities "
+        f"(UAS, TNAU, KAU, ICAR) and state agriculture departments for use by "
+        f"farmers, extension officers, and dealers.",
         "",
-        "Context for this label:",
+        "Context for this cell:",
     ]
     if core_name:
         parts.append(f'- Data category: "{core_name}"')
     if core_description:
         parts.append(f"- Category description: {core_description}")
     parts.extend([
-        "- Audience: rural farmers and agricultural extension experts in India",
-        f"- Use the standard {target_name} term that local farmers and field experts "
-        f"actually use, NOT a literal word-for-word rendering",
-        "- If the source is a compound (e.g. 'Ash Gourd - Beetle'), translate each part "
-        "with the correct domain term (the crop name, the pest name) and keep the same "
-        "separator structure",
-        "- Preserve hyphens, slashes, and other separators exactly as in the source",
-        "- Do NOT transliterate proper-noun chemical or brand names; translate by meaning "
-        "where a domain term exists, otherwise transliterate naturally",
         "",
-        f"Source: {text}",
+        "Register rules (very important — this is NOT general translation):",
+        f"- Write the term EXACTLY as a {target_name} agricultural book, extension "
+        "bulletin, or field-officer article would write it.",
+        f"- For crop names, use the regional {target_name} name that farmers actually "
+        "use (e.g. for paddy, write the field/grain term — ಭತ್ತ in Kannada — not the "
+        "kitchen term ಅಕ್ಕಿ).",
+        "- For pests, diseases, deficiencies, and nutrients, use whichever form books "
+        "and bulletins actually use. That may be a native term, or a transliteration "
+        "of the English technical term — books transliterate freely for terms like "
+        "'Early Blight', 'Powdery Mildew', 'Hopper', 'Beetle' — follow that convention "
+        "instead of inventing literary or Sanskrit synonyms nobody reads.",
+        "- Do NOT produce poetic, literary, or Sanskrit-leaning renderings.",
+        "- Compound inputs ('Crop - Pest/Disease'): translate each part by the rules "
+        "above and keep the same separator (hyphen, slash, etc.) in the same place.",
+        "- Be CONSISTENT: the same crop must always be rendered the same way across "
+        "rows, whether it appears alone or in a 'Crop - X' compound.",
+        "",
+        f"English label to render in {target_name}: {text}",
         "",
         "Output rules — strict:",
-        f"- Reply with ONE single line: the {target_name} translation only.",
-        "- Do NOT include quotes, backticks, explanations, alternatives, parentheticals, "
-        "or English. Do NOT 'reconsider'. Do NOT add a second attempt.",
-        f"- If you are unsure, give your single best {target_name} answer in one line and stop.",
+        f"- Reply with ONE single line: the {target_name} rendering only.",
+        "- No quotes, no backticks, no explanations, no alternatives, no parentheticals, "
+        "no English notes. Do NOT 'reconsider' or add a second attempt.",
+        f"- If you are unsure, give your single best book/bulletin {target_name} answer "
+        "in one line and stop.",
     ])
     return "\n".join(parts)
 
