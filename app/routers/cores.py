@@ -882,6 +882,7 @@ async def retranslate_core(
     core_id: str,
     mode: str = Query("machine_generated_only", description="machine_generated_only or all"),
     lang: str = Query(None, description="Single language code to retranslate. Omit to retranslate all."),
+    keywords: str = Query(None, description="Optional comma-separated list. If provided, only items whose english_value contains any of these substrings (case-insensitive) get re-translated. Used to cheaply fix terminology after a TERM_HINTS update — avoids paying for a full Core re-run when only a handful of English terms changed."),
     db: AsyncSession = Depends(get_db),
     _=Depends(require_designer),
 ):
@@ -890,6 +891,7 @@ async def retranslate_core(
     lang: specific language code (e.g. 'hi') or omit for all configured languages.
     mode=machine_generated_only: preserves EXPERT_VALIDATED translations (safe default).
     mode=all: overwrites everything including EXPERT_VALIDATED — requires confirmation.
+    keywords: comma-separated substrings to filter affected items (optional).
     """
     await get_core(db, core_id)
 
@@ -916,13 +918,24 @@ async def retranslate_core(
 
     overwrite_expert = (mode == "all")
 
+    # Parse + normalize keywords into a clean list of distinct lowercased substrings.
+    keyword_list = []
+    if keywords:
+        keyword_list = [k.strip() for k in keywords.split(",") if k.strip()]
+        # Dedup while preserving order
+        seen = set()
+        keyword_list = [k for k in keyword_list if not (k.lower() in seen or seen.add(k.lower()))]
+
     from app.tasks.translation import retranslate_core as retranslate_task
-    retranslate_task.delay(core_id, target_langs, overwrite_expert)
+    retranslate_task.delay(core_id, target_langs, overwrite_expert, keyword_list)
 
     return {
-        "message": f"Re-translation queued for {len(target_langs)} language(s)",
+        "message": f"Re-translation queued for {len(target_langs)} language(s)" + (
+            f" (filtered by {len(keyword_list)} keyword(s))" if keyword_list else ""
+        ),
         "mode": mode,
         "languages": target_langs,
+        "keywords": keyword_list,
     }
 
 

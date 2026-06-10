@@ -155,28 +155,47 @@ def translate_item(self, item_id: str, english_value: str, target_langs: list[st
 
 
 @celery_app.task(name="app.tasks.translation.retranslate_core", bind=True, max_retries=2)
-def retranslate_core(self, core_id: str, target_langs: list[str], overwrite_expert: bool = False):
+def retranslate_core(
+    self,
+    core_id: str,
+    target_langs: list[str],
+    overwrite_expert: bool = False,
+    keywords: list[str] | None = None,
+):
     """
-    Re-process all items in a Core.
+    Re-process items in a Core.
+
     overwrite_expert=False: skip EXPERT_VALIDATED (safe default).
     overwrite_expert=True: overwrite everything (requires Designer confirmation).
+
+    keywords: optional list of substrings. When non-empty, only items whose
+    english_value contains any of these substrings (case-insensitive) are
+    processed. Lets us cheaply fix terminology after a TERM_HINTS update —
+    e.g., add "Aphid, Mite, Mosaic" and only ~150 items get re-translated
+    instead of all 2,237.
 
     Commits every COMMIT_EVERY successful rows so progress is visible
     live and a worker crash mid-task only loses ~COMMIT_EVERY rows.
     """
     from app.models.models import CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum
+    from sqlalchemy import or_, func as safunc
 
     engine = _get_sync_engine()
 
     with Session(engine) as session:
         mode, core_name, core_description = _get_core_context(session, core_id)
         # Fetch as tuples — no ORM objects to worry about expiring on commit.
-        items = session.execute(
-            select(CoreDataItem.id, CoreDataItem.english_value).where(
-                CoreDataItem.core_id == core_id,
-                CoreDataItem.status == StatusEnum.ACTIVE,
-            )
-        ).all()
+        query = select(CoreDataItem.id, CoreDataItem.english_value).where(
+            CoreDataItem.core_id == core_id,
+            CoreDataItem.status == StatusEnum.ACTIVE,
+        )
+        if keywords:
+            # Case-insensitive substring match against english_value.
+            query = query.where(or_(*(
+                safunc.lower(CoreDataItem.english_value).contains(k.lower())
+                for k in keywords
+            )))
+        items = session.execute(query).all()
 
         total_target = len(items) * len([l for l in target_langs if l != "en"])
         processed = 0
