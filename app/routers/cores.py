@@ -3,7 +3,7 @@ import io
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, insert
+from sqlalchemy import select, update, insert, func
 from sqlalchemy.orm import selectinload
 from app.database import get_db, acquire_entity_lock
 from app.dependencies import require_role, is_stocker_only, check_stocker_exclusive_write
@@ -142,6 +142,100 @@ async def list_core_languages(core_id: str, db: AsyncSession = Depends(get_db), 
     await get_core(db, core_id, current_user)
     result = await db.execute(select(CoreLanguageConfig).where(CoreLanguageConfig.core_id == core_id))
     return result.scalars().all()
+
+
+@router.get("/{core_id}/translation-status")
+async def get_translation_status(
+    core_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """Per-language progress for the Languages tab. Returns one entry per
+    configured language with:
+      - state: "translating" | "queued" | "complete" | "idle"
+      - translated: count of rows already in core_data_translations for this Core+lang
+      - total: count of ACTIVE items in the Core (denominator for the progress bar)
+
+    State is derived from a quick Celery RPC (active + reserved tasks) plus
+    the DB count. Polled by the UI every few seconds; intentionally
+    lightweight — no celery worker restart, no schema change.
+    """
+    await get_core(db, core_id, current_user)
+
+    # Configured languages
+    langs = (await db.execute(
+        select(CoreLanguageConfig.language_code).where(CoreLanguageConfig.core_id == core_id)
+    )).scalars().all()
+
+    # Denominator: active items in the Core
+    total = (await db.execute(
+        select(func.count())
+        .select_from(CoreDataItem)
+        .where(CoreDataItem.core_id == core_id, CoreDataItem.status == StatusEnum.ACTIVE)
+    )).scalar() or 0
+
+    # Per-lang translation counts (only count rows attached to currently-ACTIVE items)
+    count_rows = (await db.execute(
+        select(CoreDataTranslation.language_code, func.count())
+        .join(CoreDataItem, CoreDataItem.id == CoreDataTranslation.item_id)
+        .where(
+            CoreDataItem.core_id == core_id,
+            CoreDataItem.status == StatusEnum.ACTIVE,
+            CoreDataTranslation.language_code.in_(langs) if langs else False,
+        )
+        .group_by(CoreDataTranslation.language_code)
+    )).all()
+    count_by_lang = {row[0]: row[1] for row in count_rows}
+
+    # Celery inspect — sync, run off the event loop. ~1s on a warm worker.
+    # If no workers are connected, this returns None and every lang shows "idle"
+    # or "complete" based on counts alone — which is exactly what we want.
+    import asyncio
+    from app.celery_app import celery_app
+
+    def _inspect_tasks():
+        try:
+            insp = celery_app.control.inspect(timeout=2.0)
+            return (insp.active() or {}, insp.reserved() or {})
+        except Exception:
+            return ({}, {})
+
+    active, reserved = await asyncio.to_thread(_inspect_tasks)
+
+    def _matches(task: dict, lang: str) -> bool:
+        name = task.get("name", "")
+        args = task.get("args") or []
+        if not args or args[0] != core_id:
+            return False
+        if name.endswith("retranslate_core"):
+            # retranslate_core(core_id, target_langs, overwrite_expert)
+            return len(args) >= 2 and lang in (args[1] or [])
+        if name.endswith("translate_new_language_for_core"):
+            # translate_new_language_for_core(core_id, language_code)
+            return len(args) >= 2 and args[1] == lang
+        return False
+
+    active_tasks = [t for worker_tasks in active.values() for t in worker_tasks]
+    reserved_tasks = [t for worker_tasks in reserved.values() for t in worker_tasks]
+
+    out = []
+    for lang in langs:
+        translated = count_by_lang.get(lang, 0)
+        if any(_matches(t, lang) for t in active_tasks):
+            state = "translating"
+        elif any(_matches(t, lang) for t in reserved_tasks):
+            state = "queued"
+        elif total > 0 and translated >= total:
+            state = "complete"
+        else:
+            state = "idle"
+        out.append({
+            "language_code": lang,
+            "state": state,
+            "translated": translated,
+            "total": total,
+        })
+    return out
 
 
 @router.post("/{core_id}/languages", response_model=CoreLanguageConfigOut, status_code=status.HTTP_201_CREATED)
