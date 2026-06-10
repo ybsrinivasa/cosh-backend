@@ -62,6 +62,7 @@ TERM_HINTS = {
         "Brown Plant Hopper → ಕಂದು ಜಿಗಿ ಹುಳು",
         "Beetle → ಜೀರುಂಡೆ  (NOT ಬಿಟಲ್)",
         "Fruit Fly → ಹಣ್ಣಿನ ನೊಣ",
+        "Aphid → ಸಸಿ ಹೇನು  (NOT ಜಿಗಟು ಹುಳು — that's not the standard book term)",
         "Shoot and Fruit Borer → ಚಿಗುರು ಮತ್ತು ಕಾಯಿ ಕೊರಕ",
         # diseases
         "Blast → ಬೆಂಕಿ ರೋಗ  (the 'fire disease' term used in books; NOT a literal translation)",
