@@ -118,9 +118,9 @@ def claude_translate(
                 # Short labels — 80 tokens covers even longer Indic compounds with
                 # script overhead. Capping low also blocks the "let me reconsider…"
                 # rambling pattern observed on uncertain agricultural terms.
+                # (The Anthropic API rejects whitespace-only stop_sequences,
+                # so we enforce single-line at parse time below instead.)
                 "max_tokens": 80,
-                # First newline ends the answer — the prompt requires single-line output.
-                "stop_sequences": ["\n"],
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60.0,
@@ -136,13 +136,23 @@ def claude_translate(
         if not content or content[0].get("type") != "text":
             logger.warning(f"Claude API returned unexpected shape: {json.dumps(data)[:200]}")
             return None
-        translated = (content[0].get("text") or "").strip()
+        raw = (content[0].get("text") or "").strip()
+        # Take ONLY the first non-empty line. Claude occasionally rambles past
+        # the "no alternatives" instruction with a "Let me reconsider…" second
+        # line on uncertain agricultural terms; the first line is always the
+        # primary answer.
+        first_line = ""
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                first_line = line
+                break
         # Strip surrounding quotes if Claude added them despite instructions.
-        if len(translated) >= 2 and translated[0] in '"' "'" and translated[-1] == translated[0]:
-            translated = translated[1:-1].strip()
-        if not translated:
+        if len(first_line) >= 2 and first_line[0] in '"' "'" and first_line[-1] == first_line[0]:
+            first_line = first_line[1:-1].strip()
+        if not first_line:
             return None
-        return translated
+        return first_line
     except Exception as e:
         logger.warning(f"Claude API call failed for lang={target_lang}: {e}")
         return None
