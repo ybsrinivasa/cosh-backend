@@ -240,6 +240,23 @@ TERM_HINTS = {
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+
+class ClaudeCreditExhaustedError(RuntimeError):
+    """Raised when Anthropic returns 'credit balance too low'.
+
+    Deliberately propagated up out of `claude_translate()` (NOT swallowed
+    like generic API failures) so that bulk translation tasks abort
+    immediately rather than silently falling through to the
+    IndicTrans2/Google fallback, which produces poor-quality
+    transliterations for short agricultural labels. The previous behaviour
+    looked like 'success' in the status badge but quietly destroyed
+    quality — see the 2026-06-11 Hindi incident.
+    """
+    pass
+
+
+
 # Sonnet 4.6 was confirmed by a native-Kannada-speaking domain expert as
 # producing the right register — terms that appear in agricultural books
 # and university extension publications, not literary/Sanskrit synonyms,
@@ -406,6 +423,20 @@ def claude_translate(
             )
             time.sleep(wait)
         if response is None or response.status_code != 200:
+            # Credit exhaustion is a deliberate, persistent failure — every
+            # subsequent call will fail the same way until the user tops up.
+            # Raise loudly so the bulk task aborts and the user sees it, rather
+            # than letting 2,000+ rows silently fall through to the
+            # IndicTrans2/Google fallback (which produces garbage for these
+            # short agricultural labels).
+            if response is not None and response.status_code == 400:
+                body_lower = (response.text or "").lower()
+                if "credit balance" in body_lower or "too low" in body_lower:
+                    raise ClaudeCreditExhaustedError(
+                        f"Anthropic credit balance exhausted (lang={target_lang}). "
+                        "Top up at https://console.anthropic.com/settings/billing "
+                        "and re-fire the translation."
+                    )
             logger.warning(
                 f"Claude API HTTP {response.status_code if response else '?'} for "
                 f"lang={target_lang}: {response.text[:200] if response else '(no response)'}"
@@ -433,6 +464,9 @@ def claude_translate(
         if not first_line:
             return None
         return first_line
+    except ClaudeCreditExhaustedError:
+        # Propagate — task layer aborts cleanly. Never silently downgrade.
+        raise
     except Exception as e:
         logger.warning(f"Claude API call failed for lang={target_lang}: {e}")
         return None

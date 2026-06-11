@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app
 from app.services.translation_service import translate_text
 from app.services.transliteration_service import transliterate_text
-from app.services.claude_translation_service import claude_translate
+from app.services.claude_translation_service import claude_translate, ClaudeCreditExhaustedError
 
 logger = logging.getLogger(__name__)
 
@@ -204,42 +204,53 @@ def retranslate_core(
             f"items={len(items)} langs={target_langs} target={total_target}"
         )
 
-        for item_id, english_value in items:
-            for lang in target_langs:
-                if lang == "en":
-                    continue
+        try:
+            for item_id, english_value in items:
+                for lang in target_langs:
+                    if lang == "en":
+                        continue
 
-                existing = session.execute(
-                    select(CoreDataTranslation).where(
-                        CoreDataTranslation.item_id == item_id,
-                        CoreDataTranslation.language_code == lang,
-                    )
-                ).scalar_one_or_none()
+                    existing = session.execute(
+                        select(CoreDataTranslation).where(
+                            CoreDataTranslation.item_id == item_id,
+                            CoreDataTranslation.language_code == lang,
+                        )
+                    ).scalar_one_or_none()
 
-                if existing and existing.validation_status == ValidationStatus.EXPERT_VALIDATED and not overwrite_expert:
-                    continue
+                    if existing and existing.validation_status == ValidationStatus.EXPERT_VALIDATED and not overwrite_expert:
+                        continue
 
-                processed_text = _process_text(english_value, "en", lang, mode, core_name, core_description)
-                if not processed_text:
-                    continue
+                    processed_text = _process_text(english_value, "en", lang, mode, core_name, core_description)
+                    if not processed_text:
+                        continue
 
-                if existing:
-                    existing.translated_value = processed_text
-                    existing.validation_status = ValidationStatus.MACHINE_GENERATED
-                else:
-                    session.add(CoreDataTranslation(
-                        item_id=item_id,
-                        language_code=lang,
-                        translated_value=processed_text,
-                        validation_status=ValidationStatus.MACHINE_GENERATED,
-                    ))
-                processed += 1
-                if processed % COMMIT_EVERY == 0:
-                    session.commit()
-                    logger.info(
-                        f"[retranslate_core] core={core_id} progress "
-                        f"{processed}/{total_target}"
-                    )
+                    if existing:
+                        existing.translated_value = processed_text
+                        existing.validation_status = ValidationStatus.MACHINE_GENERATED
+                    else:
+                        session.add(CoreDataTranslation(
+                            item_id=item_id,
+                            language_code=lang,
+                            translated_value=processed_text,
+                            validation_status=ValidationStatus.MACHINE_GENERATED,
+                        ))
+                    processed += 1
+                    if processed % COMMIT_EVERY == 0:
+                        session.commit()
+                        logger.info(
+                            f"[retranslate_core] core={core_id} progress "
+                            f"{processed}/{total_target}"
+                        )
+        except ClaudeCreditExhaustedError as e:
+            # Persist partial progress before bailing — the rows that DID
+            # land are still valid. The task fails (Celery marks FAILURE,
+            # no retry since we don't call self.retry) so the user sees it.
+            session.commit()
+            logger.error(
+                f"[retranslate_core] ABORTING core={core_id} at "
+                f"{processed}/{total_target} — {e}"
+            )
+            raise
 
         # Final partial batch
         session.commit()
@@ -272,32 +283,40 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
             f"lang={language_code} items={total}"
         )
 
-        for item_id, english_value in items:
-            existing = session.execute(
-                select(CoreDataTranslation).where(
-                    CoreDataTranslation.item_id == item_id,
-                    CoreDataTranslation.language_code == language_code,
-                )
-            ).scalar_one_or_none()
-
-            if existing:
-                continue
-
-            processed_text = _process_text(english_value, "en", language_code, mode, core_name, core_description)
-            if processed_text:
-                session.add(CoreDataTranslation(
-                    item_id=item_id,
-                    language_code=language_code,
-                    translated_value=processed_text,
-                    validation_status=ValidationStatus.MACHINE_GENERATED,
-                ))
-                processed += 1
-                if processed % COMMIT_EVERY == 0:
-                    session.commit()
-                    logger.info(
-                        f"[translate_new_language_for_core] core={core_id} "
-                        f"lang={language_code} progress {processed}/{total}"
+        try:
+            for item_id, english_value in items:
+                existing = session.execute(
+                    select(CoreDataTranslation).where(
+                        CoreDataTranslation.item_id == item_id,
+                        CoreDataTranslation.language_code == language_code,
                     )
+                ).scalar_one_or_none()
+
+                if existing:
+                    continue
+
+                processed_text = _process_text(english_value, "en", language_code, mode, core_name, core_description)
+                if processed_text:
+                    session.add(CoreDataTranslation(
+                        item_id=item_id,
+                        language_code=language_code,
+                        translated_value=processed_text,
+                        validation_status=ValidationStatus.MACHINE_GENERATED,
+                    ))
+                    processed += 1
+                    if processed % COMMIT_EVERY == 0:
+                        session.commit()
+                        logger.info(
+                            f"[translate_new_language_for_core] core={core_id} "
+                            f"lang={language_code} progress {processed}/{total}"
+                        )
+        except ClaudeCreditExhaustedError as e:
+            session.commit()
+            logger.error(
+                f"[translate_new_language_for_core] ABORTING core={core_id} "
+                f"lang={language_code} at {processed}/{total} — {e}"
+            )
+            raise
 
         session.commit()
     logger.info(
