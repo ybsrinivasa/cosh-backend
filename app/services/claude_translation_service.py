@@ -319,6 +319,14 @@ def _build_prompt(text: str, target_lang: str, core_name: Optional[str], core_de
         "across rows, whether it appears alone or as the modifier in a 'Crop - X' "
         "compound (allowing for the grammatical case shift just described).",
         "",
+        "- **Numerals: leave Hindu-Arabic digits (0-9) EXACTLY as they appear.** Do "
+        "NOT convert them to the native script's digit forms (no ೦೧೨ for Kannada, "
+        "no ०१२ for Hindi/Marathi, no ০১২ for Bengali, no ௦௧௨ for Tamil, no "
+        "౦౧౨ for Telugu, no ٠١٢ for Urdu, etc.). This rule also applies to digits "
+        "embedded inside compound text — translate the surrounding words, keep the "
+        "numerals untouched. Preserve symbols around numerals as-is too: %, /, -, ., :, "
+        "decimal points, ratios, units (e.g. '19-19-19', '0.5 g/L', '10%', '2 weeks').",
+        "",
         f"English label to render in {target_name}: {text}",
         "",
         "Output rules — strict:",
