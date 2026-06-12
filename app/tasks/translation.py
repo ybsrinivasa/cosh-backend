@@ -177,13 +177,22 @@ def retranslate_core(
     Commits every COMMIT_EVERY successful rows so progress is visible
     live and a worker crash mid-task only loses ~COMMIT_EVERY rows.
     """
-    from app.models.models import CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum
+    from app.models.models import (
+        CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum,
+        CoreProductTag, SyncChangeLog, EntityType, ChangeType,
+    )
     from sqlalchemy import or_, func as safunc
 
     engine = _get_sync_engine()
 
     with Session(engine) as session:
         mode, core_name, core_description = _get_core_context(session, core_id)
+        # One sync event per (item × tagged product) — fetch products ONCE.
+        # If the Core has no products tagged, sync events are skipped (the
+        # translation rows still land in core_data_translations).
+        product_ids = session.execute(
+            select(CoreProductTag.product_id).where(CoreProductTag.core_id == core_id)
+        ).scalars().all()
         # Fetch as tuples — no ORM objects to worry about expiring on commit.
         query = select(CoreDataItem.id, CoreDataItem.english_value).where(
             CoreDataItem.core_id == core_id,
@@ -201,11 +210,13 @@ def retranslate_core(
         processed = 0
         logger.info(
             f"[retranslate_core] core={core_id} name={core_name!r} mode={mode} "
-            f"items={len(items)} langs={target_langs} target={total_target}"
+            f"items={len(items)} langs={target_langs} target={total_target} "
+            f"products_tagged={len(product_ids)}"
         )
 
         try:
             for item_id, english_value in items:
+                item_touched = False
                 for lang in target_langs:
                     if lang == "en":
                         continue
@@ -235,12 +246,25 @@ def retranslate_core(
                             validation_status=ValidationStatus.MACHINE_GENERATED,
                         ))
                     processed += 1
+                    item_touched = True
                     if processed % COMMIT_EVERY == 0:
                         session.commit()
                         logger.info(
                             f"[retranslate_core] core={core_id} progress "
                             f"{processed}/{total_target}"
                         )
+                # One sync event per (item × product) — matches translate_item.
+                # Item-level (not per language) so a multi-lang re-run emits one
+                # event per item, not N. RootsTalk consumer reads the full
+                # translations row when it processes the event.
+                if item_touched:
+                    for pid in product_ids:
+                        session.add(SyncChangeLog(
+                            product_id=pid,
+                            entity_type=EntityType.TRANSLATION,
+                            entity_id=item_id,
+                            change_type=ChangeType.TRANSLATION_UPDATED,
+                        ))
         except ClaudeCreditExhaustedError as e:
             # Persist partial progress before bailing — the rows that DID
             # land are still valid. The task fails (Celery marks FAILURE,
@@ -263,12 +287,18 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
     When a new language is added to a Core — process all existing active items
     for that language only. Commits in batches like retranslate_core.
     """
-    from app.models.models import CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum
+    from app.models.models import (
+        CoreDataItem, CoreDataTranslation, ValidationStatus, StatusEnum,
+        CoreProductTag, SyncChangeLog, EntityType, ChangeType,
+    )
 
     engine = _get_sync_engine()
 
     with Session(engine) as session:
         mode, core_name, core_description = _get_core_context(session, core_id)
+        product_ids = session.execute(
+            select(CoreProductTag.product_id).where(CoreProductTag.core_id == core_id)
+        ).scalars().all()
         items = session.execute(
             select(CoreDataItem.id, CoreDataItem.english_value).where(
                 CoreDataItem.core_id == core_id,
@@ -280,7 +310,7 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
         processed = 0
         logger.info(
             f"[translate_new_language_for_core] core={core_id} name={core_name!r} mode={mode} "
-            f"lang={language_code} items={total}"
+            f"lang={language_code} items={total} products_tagged={len(product_ids)}"
         )
 
         try:
@@ -303,6 +333,13 @@ def translate_new_language_for_core(self, core_id: str, language_code: str):
                         translated_value=processed_text,
                         validation_status=ValidationStatus.MACHINE_GENERATED,
                     ))
+                    for pid in product_ids:
+                        session.add(SyncChangeLog(
+                            product_id=pid,
+                            entity_type=EntityType.TRANSLATION,
+                            entity_id=item_id,
+                            change_type=ChangeType.TRANSLATION_UPDATED,
+                        ))
                     processed += 1
                     if processed % COMMIT_EVERY == 0:
                         session.commit()
