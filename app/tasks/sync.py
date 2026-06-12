@@ -20,11 +20,24 @@ def _get_sync_engine():
 
 
 @celery_app.task(name="app.tasks.sync.dispatch_to_product", bind=True, max_retries=2)
-def dispatch_to_product(self, sync_history_id: str, payload: dict, endpoint_url: str, api_key: str):
+def dispatch_to_product(
+    self,
+    sync_history_id: str,
+    payload: dict,
+    endpoint_url: str,
+    api_key: str,
+    dispatched_item_ids: list[str] | None = None,
+):
     """
     BL-C-07 steps 5-7.
     Posts the Cosh sync payload to the product's endpoint.
     Updates sync_history and sync_change_log on completion.
+
+    dispatched_item_ids: the core_data_item / connect_data_item IDs that
+    were actually included in this dispatch. On success, only sync_change_log
+    rows with entity_id in this list are marked as included. If None
+    (legacy call signature for tasks queued before 2026-06-12), all pending
+    events for the product are marked — the old, buggy behaviour.
     """
     import requests as req
     from app.models.models import SyncHistory, SyncChangeLog, ProductSyncState, SyncStatus, SyncMode
@@ -84,16 +97,32 @@ def dispatch_to_product(self, sync_history_id: str, payload: dict, endpoint_url:
         history.completed_at = datetime.now(timezone.utc)
         session.flush()
 
-        # BL-C-07 step 6: on success, mark all dispatched items in sync_change_log
+        # BL-C-07 step 6: on success, mark dispatched items in sync_change_log.
+        # Filter by the entity_ids that were actually included in the payload
+        # so that other Cores' pending events don't get marked synced. (See
+        # docstring for the dispatched_item_ids contract.)
         if history.status in (SyncStatus.COMPLETED, SyncStatus.PARTIAL):
-            session.execute(
-                update(SyncChangeLog)
-                .where(
-                    SyncChangeLog.product_id == history.product_id,
-                    SyncChangeLog.included_in_sync_id.is_(None),
+            if dispatched_item_ids is None:
+                # Legacy path — pre-fix queued task. Mark everything pending.
+                session.execute(
+                    update(SyncChangeLog)
+                    .where(
+                        SyncChangeLog.product_id == history.product_id,
+                        SyncChangeLog.included_in_sync_id.is_(None),
+                    )
+                    .values(included_in_sync_id=sync_history_id)
                 )
-                .values(included_in_sync_id=sync_history_id)
-            )
+            elif dispatched_item_ids:
+                session.execute(
+                    update(SyncChangeLog)
+                    .where(
+                        SyncChangeLog.product_id == history.product_id,
+                        SyncChangeLog.included_in_sync_id.is_(None),
+                        SyncChangeLog.entity_id.in_(dispatched_item_ids),
+                    )
+                    .values(included_in_sync_id=sync_history_id)
+                )
+            # else: empty list — nothing was actually dispatched, mark nothing.
 
             # Update product_sync_state
             state = session.execute(

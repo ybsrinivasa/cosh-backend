@@ -6,7 +6,7 @@ from app.database import get_db
 from app.dependencies import require_role
 from app.models.models import (
     UserRole, ProductRegistry, CoreProductTag, ConnectProductTag,
-    Core, Connect, SyncMode, StatusEnum,
+    Core, Connect, CoreDataItem, ConnectDataItem, SyncMode, StatusEnum,
 )
 from app.schemas.sync import (
     ChangeTableResponse, DispatchRequest, DispatchResponse,
@@ -116,8 +116,29 @@ async def dispatch_sync(
     # Retrieve API key — stored directly in secret_name field at local dev stage
     api_key = product.sync_api_key_secret_name or ""
 
+    # Collect the data-item IDs we're actually dispatching. The Celery task
+    # will mark ONLY these entity_ids as synced in sync_change_log — not all
+    # pending events for the product. Without this, syncing one Core wiped
+    # every other Core's pending events from the Sync UI (discovered
+    # 2026-06-12 after three manual resets). entity_id in sync_change_log
+    # points at core_data_item.id / connect_data_item.id for all
+    # entity_types we emit (CORE_DATA_ITEM, TRANSLATION, CONNECT_DATA_ITEM).
+    dispatched_item_ids: list[str] = []
+    if core_ids:
+        rows = (await db.execute(
+            select(CoreDataItem.id).where(CoreDataItem.core_id.in_(core_ids))
+        )).scalars().all()
+        dispatched_item_ids.extend(rows)
+    if connect_ids:
+        rows = (await db.execute(
+            select(ConnectDataItem.id).where(ConnectDataItem.connect_id.in_(connect_ids))
+        )).scalars().all()
+        dispatched_item_ids.extend(rows)
+
     from app.tasks.sync import dispatch_to_product
-    dispatch_to_product.delay(sync_id, payload, product.sync_endpoint_url, api_key)
+    dispatch_to_product.delay(
+        sync_id, payload, product.sync_endpoint_url, api_key, dispatched_item_ids
+    )
 
     entity_count = len(core_ids) + len(connect_ids)
     return DispatchResponse(
