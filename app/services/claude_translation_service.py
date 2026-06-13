@@ -63,7 +63,7 @@ TERM_HINTS = {
         "Beetle → ಜೀರುಂಡೆ  (NOT ಬಿಟಲ್)",
         "Hadda Beetle → ಹಡ್ಡ ಜೀರುಂಡೆ  (keep the 'Hadda' qualifier — it identifies the species)",
         "Fruit Fly → ಹಣ್ಣಿನ ನೊಣ",
-        "Aphid → ಸಸ್ಯ ಹೇನು  (NOT ಸಸಿ ಹೇನು, NOT ಜಿಗಟು ಹುಳು. Source: UAS Bangalore Padakosh Pub-255, p26 — book is consistent: 'Aphis gossypii' → ಹತ್ತಿ ಸಸ್ಯಹೇನು, 'Aphidicide' → ಸಸ್ಯ ಹೇನು ನಾಶಕ)",
+        "Aphid → ಸಸ್ಯ ಹೇನು  (write the ಸ್ಯ conjunct exactly — ಸ + ್ + ಯ. This is the UAS Bangalore Padakosh standard, Pub-255 p26, used across the book: 'Aphis gossypii' → ಹತ್ತಿ ಸಸ್ಯಹೇನು; 'Aphidicide' → ಸಸ್ಯ ಹೇನು ನಾಶಕ. Use ಸಸ್ಯ ಹೇನು for EVERY 'Aphid' in EVERY crop/compound.)",
         "Leaf Miner → ರಂಗೋಲಿ ಹುಳು  (named after rangoli — the curving trail it leaves on the leaf; NOT 'leaf-eating worm')",
         "Mite → ನುಸಿ  (NOT the transliteration ಮಿಟೆ)",
         "Nematode → ಜಂತು ಹುಳು  (NOT the transliteration ನೆಮಟೋಡ್)",
