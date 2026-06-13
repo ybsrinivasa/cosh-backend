@@ -242,6 +242,54 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
 
+# Deterministic post-processing rules. Applied AFTER Sonnet returns, to
+# force the right form for terms where Sonnet has a stubborn internal prior
+# that resists prompt-level instructions (TERM_HINTS).
+#
+# Background: 2026-06-13 — Aphid was supposed to render as ಸಸ್ಯ ಹೇನು (UAS
+# Padakosh Pub-255 standard). Sonnet kept producing ಸಸಿ ಹೇನು across every
+# row, regardless of prompt phrasing (positive-only directive, negation,
+# script-level explanation — all failed). The model's training prior on
+# this term is unusually strong. Rather than burn more prompt-engineering
+# cycles, we just swap the wrong string for the right one before storing.
+#
+# Rules are keyed by target language. Each rule is a tuple of:
+#   (english_trigger, wrong_form_to_replace, right_form_to_write)
+# The english_trigger is matched case-insensitively against the original
+# English input. If matched, every occurrence of wrong_form in the
+# translation is replaced with right_form.
+#
+# Add a rule only when:
+#   1. A TERM_HINTS entry already exists for the same English term, AND
+#   2. Expert review confirms Sonnet ignores it consistently.
+# Keep this list short — it's a sledgehammer, not the primary lever.
+LOCKED_REPLACEMENTS: dict[str, list[tuple[str, str, str]]] = {
+    "kn": [
+        ("aphid", "ಸಸಿ ಹೇನು", "ಸಸ್ಯ ಹೇನು"),
+    ],
+}
+
+
+def _apply_locked_replacements(
+    original_english: str, target_lang: str, translated: str
+) -> str:
+    """Apply LOCKED_REPLACEMENTS for the given target language.
+
+    Returns the translated string with any matching wrong→right swaps
+    applied. No-op if the target language has no rules or if the English
+    input doesn't trigger any rule.
+    """
+    rules = LOCKED_REPLACEMENTS.get(target_lang)
+    if not rules:
+        return translated
+    english_lower = (original_english or "").lower()
+    out = translated
+    for trigger, wrong, right in rules:
+        if trigger in english_lower and wrong in out:
+            out = out.replace(wrong, right)
+    return out
+
+
 class ClaudeCreditExhaustedError(RuntimeError):
     """Raised when Anthropic returns 'credit balance too low'.
 
@@ -463,7 +511,7 @@ def claude_translate(
             first_line = first_line[1:-1].strip()
         if not first_line:
             return None
-        return first_line
+        return _apply_locked_replacements(text, target_lang, first_line)
     except ClaudeCreditExhaustedError:
         # Propagate — task layer aborts cleanly. Never silently downgrade.
         raise
