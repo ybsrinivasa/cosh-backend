@@ -80,100 +80,79 @@ async def get_change_table(db: AsyncSession, product_id: str) -> dict:
     """
     P6-02 step 2: Return the change table — one summary row per affected Core or Connect.
     Groups sync_change_log entries by the parent Core or Connect.
+
+    Implementation note: this used to load all pending sync_change_log rows
+    into Python and then issue `WHERE id IN (...)` lookups. That exceeded
+    asyncpg's 32767-parameter limit once translation backfills pushed any
+    single product over ~32K pending events ("the number of query
+    arguments cannot exceed 32767" → 500 → empty UI). Rewritten as two
+    SQL-side JOIN+GROUP BY queries so the bind-parameter cost is constant
+    regardless of how many pending events the product has.
     """
     product = await get_product(db, product_id)
 
-    pending = (await db.execute(
-        select(SyncChangeLog).where(
-            SyncChangeLog.product_id == product_id,
-            SyncChangeLog.included_in_sync_id.is_(None),
-        )
-    )).scalars().all()
-
-    # Map entity_id → (entity_name, entity_category, set of change_types)
     grouped: dict[str, dict] = {}
 
-    # Collect all item IDs by type for batch lookup
-    core_item_ids = [r.entity_id for r in pending if r.entity_type in (EntityType.CORE_DATA_ITEM, EntityType.TRANSLATION)]
-    connect_item_ids = [r.entity_id for r in pending if r.entity_type == EntityType.CONNECT_DATA_ITEM]
+    # Core / Translation events → group by parent Core in SQL.
+    # array_agg(DISTINCT ...) returns one row per Core with the set of
+    # change_types seen, and a count of associated sync_change_log rows.
+    core_rows = (await db.execute(
+        select(
+            Core.id.label("entity_id"),
+            Core.name.label("entity_name"),
+            func.count().label("item_count"),
+            func.array_agg(func.distinct(SyncChangeLog.change_type)).label("change_types"),
+        )
+        .join(CoreDataItem, CoreDataItem.id == SyncChangeLog.entity_id)
+        .join(Core, Core.id == CoreDataItem.core_id)
+        .where(
+            SyncChangeLog.product_id == product_id,
+            SyncChangeLog.included_in_sync_id.is_(None),
+            SyncChangeLog.entity_type.in_([EntityType.CORE_DATA_ITEM, EntityType.TRANSLATION]),
+        )
+        .group_by(Core.id, Core.name)
+    )).all()
 
-    # Batch lookup: core_data_item → core
-    core_item_map: dict[str, str] = {}  # item_id → core_id
-    if core_item_ids:
-        rows = (await db.execute(
-            select(CoreDataItem.id, CoreDataItem.core_id).where(CoreDataItem.id.in_(core_item_ids))
-        )).all()
-        core_item_map = {r[0]: r[1] for r in rows}
-
-    # Batch lookup: cores
-    all_core_ids = list(set(core_item_map.values()))
-    core_name_map: dict[str, str] = {}
-    if all_core_ids:
-        rows = (await db.execute(
-            select(Core.id, Core.name).where(Core.id.in_(all_core_ids))
-        )).all()
-        core_name_map = {r[0]: r[1] for r in rows}
-
-    # Batch lookup: connect_data_item → connect
-    connect_item_map: dict[str, str] = {}  # cdi_id → connect_id
-    if connect_item_ids:
-        rows = (await db.execute(
-            select(ConnectDataItem.id, ConnectDataItem.connect_id).where(ConnectDataItem.id.in_(connect_item_ids))
-        )).all()
-        connect_item_map = {r[0]: r[1] for r in rows}
-
-    all_connect_ids = list(set(connect_item_map.values()))
-    connect_name_map: dict[str, str] = {}
-    if all_connect_ids:
-        rows = (await db.execute(
-            select(Connect.id, Connect.name).where(Connect.id.in_(all_connect_ids))
-        )).all()
-        connect_name_map = {r[0]: r[1] for r in rows}
-
-    # Build grouped summary
-    for row in pending:
-        if row.entity_type in (EntityType.CORE_DATA_ITEM, EntityType.TRANSLATION):
-            core_id = core_item_map.get(row.entity_id)
-            if not core_id:
-                continue
-            key = f"core:{core_id}"
-            if key not in grouped:
-                grouped[key] = {
-                    "entity_id": core_id,
-                    "entity_name": core_name_map.get(core_id, core_id),
-                    "entity_category": "Core",
-                    "change_types": set(),
-                    "item_count": 0,
-                }
-            grouped[key]["change_types"].add(row.change_type.value)
-            grouped[key]["item_count"] += 1
-
-        elif row.entity_type == EntityType.CONNECT_DATA_ITEM:
-            connect_id = connect_item_map.get(row.entity_id)
-            if not connect_id:
-                continue
-            key = f"connect:{connect_id}"
-            if key not in grouped:
-                grouped[key] = {
-                    "entity_id": connect_id,
-                    "entity_name": connect_name_map.get(connect_id, connect_id),
-                    "entity_category": "Connect",
-                    "change_types": set(),
-                    "item_count": 0,
-                }
-            grouped[key]["change_types"].add(row.change_type.value)
-            grouped[key]["item_count"] += 1
-
-    entries = [
-        {
-            "entity_id": v["entity_id"],
-            "entity_name": v["entity_name"],
-            "entity_category": v["entity_category"],
-            "change_types": sorted(v["change_types"]),
-            "item_count": v["item_count"],
+    for r in core_rows:
+        # change_types comes back as a list of enum values (strings); normalise to sorted unique list.
+        cts = sorted({(c.value if hasattr(c, "value") else str(c)) for c in (r.change_types or [])})
+        grouped[f"core:{r.entity_id}"] = {
+            "entity_id": r.entity_id,
+            "entity_name": r.entity_name,
+            "entity_category": "Core",
+            "change_types": cts,
+            "item_count": r.item_count,
         }
-        for v in grouped.values()
-    ]
+
+    # Connect events → group by parent Connect in SQL, same shape.
+    connect_rows = (await db.execute(
+        select(
+            Connect.id.label("entity_id"),
+            Connect.name.label("entity_name"),
+            func.count().label("item_count"),
+            func.array_agg(func.distinct(SyncChangeLog.change_type)).label("change_types"),
+        )
+        .join(ConnectDataItem, ConnectDataItem.id == SyncChangeLog.entity_id)
+        .join(Connect, Connect.id == ConnectDataItem.connect_id)
+        .where(
+            SyncChangeLog.product_id == product_id,
+            SyncChangeLog.included_in_sync_id.is_(None),
+            SyncChangeLog.entity_type == EntityType.CONNECT_DATA_ITEM,
+        )
+        .group_by(Connect.id, Connect.name)
+    )).all()
+
+    for r in connect_rows:
+        cts = sorted({(c.value if hasattr(c, "value") else str(c)) for c in (r.change_types or [])})
+        grouped[f"connect:{r.entity_id}"] = {
+            "entity_id": r.entity_id,
+            "entity_name": r.entity_name,
+            "entity_category": "Connect",
+            "change_types": cts,
+            "item_count": r.item_count,
+        }
+
+    entries = list(grouped.values())
 
     return {
         "product_id": product_id,
