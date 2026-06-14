@@ -38,8 +38,20 @@ require_designer_or_stocker = require_role(UserRole.DESIGNER, UserRole.STOCKER, 
 # ── Core CRUD ──────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=list[CoreOut])
-async def list_cores(db: AsyncSession = Depends(get_db), current_user=Depends(require_designer_or_stocker)):
-    q = select(Core).where(Core.status == StatusEnum.ACTIVE).order_by(Core.name)
+async def list_cores(
+    status: str = "ACTIVE",
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(require_designer_or_stocker),
+):
+    """List Cores. `status` filters by Core.status:
+      - "ACTIVE" (default — preserves prior behaviour)
+      - "INACTIVE"
+      - "ALL" — both, used by the admin "Show inactive" toggle
+    """
+    q = select(Core).order_by(Core.name)
+    if status in ("ACTIVE", "INACTIVE"):
+        q = q.where(Core.status == StatusEnum(status))
+    # "ALL" or any other value: no status filter
     if is_stocker_only(current_user):
         # Stocker sees only Cores directly assigned to them.
         # Schema-referenced Cores are loaded by the Connect entry form directly
