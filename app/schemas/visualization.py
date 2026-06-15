@@ -92,6 +92,11 @@ class VizEdge(BaseModel):
     # Optional human-readable label sourced from the Connect's name — handy
     # for tooltips. We resolve it server-side so the renderer stays dumb.
     connect_name: Optional[str] = None
+    # In connect-slice "Full Mode" (one edge per row pair, no hubs),
+    # `row_id` carries the source ConnectDataItem.id so the frontend can
+    # later show the participating row's full context when the user clicks
+    # an individual strand within a fanned bundle.
+    row_id: Optional[str] = None
 
 
 class SliceOut(BaseModel):

@@ -363,19 +363,28 @@ async def connects_list(
     ])
 
 
-# ── /viz/connect-slice (Phase 3.2) ───────────────────────────────────────────
-# This is the hub-and-spoke renderer used for Connects whose schema includes
-# CONNECT-type positions (e.g., "Pest Diagnosis", which links Symptom +
-# (Pest + Pest Stage) + (Crop + Crop Stage), reaching 5 underlying Cores per
-# row). The Neo4J upload code only stores CORE→CORE edges, so multi-Connect
-# rows are invisible to the regular /viz/slice. Here we re-resolve every
-# row from Postgres — including following CONNECT-typed positions to their
-# referenced rows' Core items — and emit a virtual hub node per
-# ConnectDataItem with spokes out to each resolved Core item.
+# ── /viz/connect-slice (Phase 3.2 / Full Mode 2026-06-15) ────────────────────
+# Full Mode rendering (2026-06-15 redesign):
+#   No hub nodes. Each row is "flattened" into pairwise edges between every
+#   pair of CoreDataItems in that row. So a Pest Diagnosis row touching
+#   {Tomato, Vegetative, Aphid, Larva, Leaf, Yellow Spots} contributes 15
+#   edges (C(6,2)). When Tomato and Leaf co-occur in 50 rows, you see 50
+#   parallel edges — the frontend fans them out via curvature+rotation so
+#   they look bundled when zoomed out and individual when zoomed in.
+#
+#   Each edge carries `row_id` (the source ConnectDataItem.id) so the UI
+#   can later show "this specific strand was Aphid/Larva/Yellow Spots"
+#   on hover or click.
+#
+#   This replaces the old hub-and-spoke model where every row became a hub
+#   with N spokes to its items. The hub renderer felt "chaotic" in demos
+#   because 100 rows = 100 visually similar hubs around a small set of
+#   reused leaves.
 
-# Tight cap — each hub draws N spokes, so 100 hubs can already mean ~500
-# edges. The frontend's MAX_EDGES budget is the visual ceiling.
-HUB_LIMIT = 200
+# Row cap. We don't dedupe edges (the whole point is to show every strand),
+# so the edge count grows like ROW_LIMIT × C(items_per_row, 2). For a
+# 6-position Connect that's 15× — so 200 rows → ~3,000 edges max.
+ROW_LIMIT = 200
 
 
 @router.get("/connect-slice", response_model=SliceOut)
@@ -453,11 +462,10 @@ async def connect_slice(
             continue
         resolved_rows.append((row.id, items))
 
-    truncated = len(resolved_rows) > HUB_LIMIT
-    resolved_rows = resolved_rows[:HUB_LIMIT]
+    truncated = len(resolved_rows) > ROW_LIMIT
+    resolved_rows = resolved_rows[:ROW_LIMIT]
 
-    # Lookup labels + Core metadata for every touched item, plus the
-    # underlying Core names so the legend works.
+    # Lookup labels + Core metadata for every touched item.
     all_item_ids = {iid for _, items in resolved_rows for iid in items}
     items_by_id: dict[str, dict] = {}
     if all_item_ids:
@@ -480,54 +488,55 @@ async def connect_slice(
         )).all()
         core_name_by_id = {r[0]: r[1] for r in c_rows}
 
-    # Synthetic "Core" id for hub colouring — every hub from this Connect
-    # gets the same palette slot, distinguishing them visually from real
-    # Core items.
-    hub_core_id = f"hub:{connect.id}"
-
     nodes: dict[str, VizNode] = {}
     edges: list[VizEdge] = []
 
-    for hub_id, item_ids in resolved_rows:
-        # Pick a first-resolved item's english_value as the hub's label —
-        # the underlying Core position 1 is usually the most identifying
-        # ("Yellowing leaves", "Tomato", etc.).
-        first_label = ""
+    for row_id, item_ids in resolved_rows:
+        # Filter to items we actually have metadata for, deduping within a
+        # row (a row never repeats positions but a CONNECT-typed position
+        # could resolve to a referenced row that shares an item — safer to
+        # dedupe).
+        valid_item_ids = []
+        seen: set[str] = set()
         for iid in item_ids:
-            md = items_by_id.get(iid)
-            if md and md["english_value"]:
-                first_label = md["english_value"]
-                break
-
-        nodes[hub_id] = VizNode(
-            id=hub_id,
-            label=first_label or connect.name,
-            core_id=hub_core_id,
-            core_name=connect.name,
-            group="filter1",
-            node_kind="hub",
-        )
-
-        for iid in item_ids:
-            md = items_by_id.get(iid)
-            if not md:
+            if iid in seen:
                 continue
-            if iid not in nodes:
-                nodes[iid] = VizNode(
-                    id=iid,
-                    label=md["english_value"] or "",
-                    core_id=md["core_id"],
-                    core_name=core_name_by_id.get(md["core_id"], ""),
-                    group="filter2",
-                    node_kind="item",
-                )
-            edges.append(VizEdge(
-                source=hub_id,
-                target=iid,
-                rel_type="IN_ROW",
-                connect_id=connect.id,
-                connect_name=connect.name,
-            ))
+            if iid not in items_by_id:
+                continue
+            seen.add(iid)
+            valid_item_ids.append(iid)
+
+        # Add each touched item as a canonical node (once across the slice).
+        for iid in valid_item_ids:
+            if iid in nodes:
+                continue
+            md = items_by_id[iid]
+            nodes[iid] = VizNode(
+                id=iid,
+                label=md["english_value"] or "",
+                core_id=md["core_id"],
+                core_name=core_name_by_id.get(md["core_id"], ""),
+                group="filter2",
+                node_kind="item",
+            )
+
+        # Emit one edge per pair of items in this row — C(N,2) edges.
+        # Sort the pair so a→b and b→a collapse to the same canonical
+        # direction (still one edge per row instance, but consistent
+        # source/target lets the frontend group parallel strands cleanly).
+        for i in range(len(valid_item_ids)):
+            for j in range(i + 1, len(valid_item_ids)):
+                a, b = valid_item_ids[i], valid_item_ids[j]
+                if a > b:
+                    a, b = b, a
+                edges.append(VizEdge(
+                    source=a,
+                    target=b,
+                    rel_type="IN_ROW",
+                    connect_id=connect.id,
+                    connect_name=connect.name,
+                    row_id=row_id,
+                ))
 
     return SliceOut(
         nodes=list(nodes.values()),
