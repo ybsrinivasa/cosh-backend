@@ -58,7 +58,10 @@ MAX_EDGES = 200
 # these represent unfilled positions, not real concepts in the knowledge
 # graph, so they should never appear as nodes in a visualisation. Compared
 # case-insensitively against the trimmed english_value.
-_ABSENT_VALUES = {"", "absent", "n/a", "na", "none", "null", "-"}
+# "blank box" added 2026-06-15 — that's the literal placeholder string the
+# data uses for unfilled positions (e.g. when a Pest Diagnosis row has no
+# meaningful Plant SubPart). User-confirmed.
+_ABSENT_VALUES = {"", "absent", "n/a", "na", "none", "null", "-", "blank box", "blank"}
 
 
 def _is_absent(value: Optional[str]) -> bool:
