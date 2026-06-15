@@ -53,6 +53,20 @@ require_viz_user = require_role(UserRole.ADMIN, UserRole.DESIGNER)
 # filters when the cap kicks in.
 MAX_EDGES = 200
 
+
+# Values that count as "absent" / "blank box" in a Connect row position —
+# these represent unfilled positions, not real concepts in the knowledge
+# graph, so they should never appear as nodes in a visualisation. Compared
+# case-insensitively against the trimmed english_value.
+_ABSENT_VALUES = {"", "absent", "n/a", "na", "none", "null", "-"}
+
+
+def _is_absent(value: Optional[str]) -> bool:
+    """Treat empty / placeholder values as non-existent for visualisation."""
+    if not value:
+        return True
+    return value.strip().lower() in _ABSENT_VALUES
+
 # Over-fetch raw Neo4J records so the Python dedup pass has a fair chance
 # to surface MAX_EDGES of unique edges even when the data has heavy
 # duplication (the State->District chain shows ~33x raw rows per unique
@@ -261,12 +275,19 @@ async def slice_(
                (filter1_type == "item" and item_id == filter1_id)
 
     nodes: dict[str, VizNode] = {}
+    # Track items we've actively rejected as absent so the edge-building
+    # pass below can skip any edge touching them, even if they appear from
+    # the other side of a record.
+    absent_ids: set[str] = set()
     for rec in records:
         for nid, ncore, nlabel in (
             (rec["a_id"], rec["a_core"], rec["a_label"]),
             (rec["b_id"], rec["b_core"], rec["b_label"]),
         ):
-            if nid in nodes:
+            if nid in nodes or nid in absent_ids:
+                continue
+            if _is_absent(nlabel):
+                absent_ids.add(nid)
                 continue
             group: Literal["filter1", "filter2"] = (
                 "filter1" if _matches_filter1(ncore, nid) else "filter2"
@@ -285,7 +306,9 @@ async def slice_(
     edges: list[VizEdge] = []
     seen_edge_keys: set[tuple] = set()
     for rec in records:
-        key = (rec["rel_type"], rec["connect_id"], rec["a_id"], rec["b_id"])
+        # Drop any edge touching an absent endpoint — same rule as nodes.
+        if rec["a_id"] in absent_ids or rec["b_id"] in absent_ids:
+            continue
         # Treat (a,b) and (b,a) on the SAME connect as one logical edge —
         # the underlying rel is directed in storage but the canvas draws
         # it once.
@@ -500,13 +523,17 @@ async def connect_slice(
         # Filter to items we actually have metadata for, deduping within a
         # row (a row never repeats positions, but a CONNECT-typed position
         # could resolve to a referenced row that shares an item — safer to
-        # dedupe).
+        # dedupe). Also drop "absent" items: blank/Absent positions in the
+        # row represent unfilled slots, not real concepts, so they
+        # shouldn't appear as nodes or contribute edges.
         valid_item_ids = []
         seen: set[str] = set()
         for iid in item_ids:
             if iid in seen:
                 continue
             if iid not in items_by_id:
+                continue
+            if _is_absent(items_by_id[iid]["english_value"]):
                 continue
             seen.add(iid)
             valid_item_ids.append(iid)
