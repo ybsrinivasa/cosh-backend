@@ -45,9 +45,13 @@ router = APIRouter(prefix="/viz", tags=["visualization"])
 
 require_viz_user = require_role(UserRole.ADMIN, UserRole.DESIGNER)
 
-# Hard cap on returned edges. 500 keeps the 3D canvas readable; we surface
-# `truncated: True` so the UI can prompt the user to tighten filters.
-MAX_EDGES = 500
+# Hard cap on returned edges. 200 keeps the 3D canvas readable AND keeps
+# the per-frame physics + label overlay work under a budget that holds up
+# during long demo sessions (was 500; lowered 2026-06-15 after a demo to
+# Karnataka Agri Dept exposed sustained-load hangs on bigger slices).
+# We surface `truncated: True` so the UI can prompt the user to tighten
+# filters when the cap kicks in.
+MAX_EDGES = 200
 
 # Over-fetch raw Neo4J records so the Python dedup pass has a fair chance
 # to surface MAX_EDGES of unique edges even when the data has heavy
