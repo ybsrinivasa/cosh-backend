@@ -489,11 +489,16 @@ async def connect_slice(
         core_name_by_id = {r[0]: r[1] for r in c_rows}
 
     nodes: dict[str, VizNode] = {}
-    edges: list[VizEdge] = []
+    # (canonical_a, canonical_b) → accumulator of {weight, row_ids}.
+    # We dedupe at the pair level (within this Connect) and surface the
+    # count as the edge's weight so the frontend can scale line width.
+    # Carrying the full row_ids list keeps the door open for a click-drill-
+    # down that lists every participating row — without an extra round trip.
+    edge_acc: dict[tuple[str, str], list[str]] = {}
 
     for row_id, item_ids in resolved_rows:
         # Filter to items we actually have metadata for, deduping within a
-        # row (a row never repeats positions but a CONNECT-typed position
+        # row (a row never repeats positions, but a CONNECT-typed position
         # could resolve to a referenced row that shares an item — safer to
         # dedupe).
         valid_item_ids = []
@@ -506,7 +511,7 @@ async def connect_slice(
             seen.add(iid)
             valid_item_ids.append(iid)
 
-        # Add each touched item as a canonical node (once across the slice).
+        # Register each touched item as a canonical node (once across the slice).
         for iid in valid_item_ids:
             if iid in nodes:
                 continue
@@ -520,23 +525,28 @@ async def connect_slice(
                 node_kind="item",
             )
 
-        # Emit one edge per pair of items in this row — C(N,2) edges.
-        # Sort the pair so a→b and b→a collapse to the same canonical
-        # direction (still one edge per row instance, but consistent
-        # source/target lets the frontend group parallel strands cleanly).
+        # Accumulate per-pair weight + row_ids. C(N,2) pair-insertions per
+        # row, but pairs collapse across rows (Tomato+Leaf appearing in 50
+        # rows becomes ONE edge with weight 50, not 50 edges).
         for i in range(len(valid_item_ids)):
             for j in range(i + 1, len(valid_item_ids)):
                 a, b = valid_item_ids[i], valid_item_ids[j]
                 if a > b:
                     a, b = b, a
-                edges.append(VizEdge(
-                    source=a,
-                    target=b,
-                    rel_type="IN_ROW",
-                    connect_id=connect.id,
-                    connect_name=connect.name,
-                    row_id=row_id,
-                ))
+                edge_acc.setdefault((a, b), []).append(row_id)
+
+    edges: list[VizEdge] = [
+        VizEdge(
+            source=a,
+            target=b,
+            rel_type="IN_ROW",
+            connect_id=connect.id,
+            connect_name=connect.name,
+            weight=len(row_ids_list),
+            row_ids=row_ids_list,
+        )
+        for (a, b), row_ids_list in edge_acc.items()
+    ]
 
     return SliceOut(
         nodes=list(nodes.values()),
