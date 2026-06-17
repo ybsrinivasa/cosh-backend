@@ -1,7 +1,29 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from datetime import datetime
 from app.models.models import CoreType, ContentType, LanguageMode, StatusEnum
+
+
+def _strip_english_translations(value):
+    """Drop spurious `en` rows from a list of CoreDataTranslation objects.
+
+    The Core item's `english_value` IS the canonical English string — an
+    `en` row in `core_data_translations` is shadow data that goes stale
+    the moment the source is edited (see user report 2026-06-17). The
+    translate_item task already skips `en`, and CSV import filters out
+    `english_value`, but legacy data still contains orphan `en` rows;
+    this strip keeps the UI honest until we delete them.
+    """
+    if not value:
+        return []
+    out = []
+    for t in value:
+        code = getattr(t, "language_code", None)
+        if code is None and isinstance(t, dict):
+            code = t.get("language_code")
+        if code != "en":
+            out.append(t)
+    return out
 
 
 class CoreCreate(BaseModel):
@@ -99,6 +121,11 @@ class CoreDataItemOut(BaseModel):
     updated_at: Optional[datetime] = None
     updated_by_name: Optional[str] = None
     translations: List[TranslationOut] = []
+
+    @field_validator("translations", mode="before")
+    @classmethod
+    def _strip_en(cls, v):
+        return _strip_english_translations(v)
 
     class Config:
         from_attributes = True
