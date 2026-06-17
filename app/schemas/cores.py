@@ -5,14 +5,16 @@ from app.models.models import CoreType, ContentType, LanguageMode, StatusEnum
 
 
 def _strip_english_translations(value):
-    """Drop spurious `en` rows from a list of CoreDataTranslation objects.
+    """Drop spurious English-language rows from a list of CoreDataTranslation objects.
 
-    The Core item's `english_value` IS the canonical English string — an
-    `en` row in `core_data_translations` is shadow data that goes stale
-    the moment the source is edited (see user report 2026-06-17). The
-    translate_item task already skips `en`, and CSV import filters out
-    `english_value`, but legacy data still contains orphan `en` rows;
-    this strip keeps the UI honest until we delete them.
+    The Core item's `english_value` IS the canonical English string — any
+    row in `core_data_translations` carrying English is shadow data that
+    goes stale the moment the source is edited (see user report 2026-06-17).
+    The translate_item task already skips `en`, and CSV import filters out
+    `english_value`, but legacy data contains rows where the source was
+    duplicated under language_code='English' (32k rows in prod). Strip
+    both 'en' (ISO) and 'english' (legacy full-name) variants, case-
+    insensitively, so the UI never shows them.
     """
     if not value:
         return []
@@ -21,7 +23,7 @@ def _strip_english_translations(value):
         code = getattr(t, "language_code", None)
         if code is None and isinstance(t, dict):
             code = t.get("language_code")
-        if code != "en":
+        if (code or "").strip().lower() not in ("en", "english"):
             out.append(t)
     return out
 
