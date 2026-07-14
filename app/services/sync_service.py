@@ -461,14 +461,22 @@ async def build_payload(
                     if sp.relationship_type_to_next else None,
             })
 
+        # INCREMENTAL emits both active and inactive items in changed_connect_item_ids
+        # so an active→inactive flip actually reaches RootsTalk. FULL still emits
+        # only active items — matches the Core-batch pattern above. Before this,
+        # an unconditional status==ACTIVE filter silently dropped deactivations
+        # from INCREMENTAL payloads; the sync_change_log rows still got marked
+        # included (via dispatched_item_ids), so Cosh showed "0 pending" while
+        # RootsTalk kept the row alive. RootsTalk 2026-07-14 flagged this.
         items_q = select(ConnectDataItem).where(
             ConnectDataItem.connect_id == connect_id,
-            ConnectDataItem.status == StatusEnum.ACTIVE,
         )
         if sync_mode == SyncMode.INCREMENTAL:
             if not changed_connect_item_ids:
                 continue
             items_q = items_q.where(ConnectDataItem.id.in_(changed_connect_item_ids))
+        else:
+            items_q = items_q.where(ConnectDataItem.status == StatusEnum.ACTIVE)
 
         cdis = (await db.execute(items_q)).scalars().all()
         if not cdis:
