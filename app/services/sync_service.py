@@ -368,14 +368,20 @@ async def build_payload(
         if entity_type_label in KNOWN_SCALAR_ATTRS:
             continue  # value-source Core; its values are inlined onto anchor items
 
+        # FULL and INCREMENTAL both emit every row (active + inactive), with the
+        # per-item `"status": "active"|"inactive"` field carrying the truth.
+        # Contract: status is always on the item, never inferred from absence.
+        # Lets a downstream consumer receive an explicit tombstone for a row it
+        # never saw (created + deactivated between two of its syncs) — the
+        # "not-in-payload = deactivate" heuristic can't cover that case.
+        # RootsTalk asked for this symmetry on 2026-07-14 after the Connect
+        # INCREMENTAL fix (commit 888f75f).
         items_q = select(CoreDataItem).where(CoreDataItem.core_id == core_id)
         if sync_mode == SyncMode.INCREMENTAL:
             relevant_ids = {eid for eid in changed_core_item_ids}
             if not relevant_ids:
                 continue
             items_q = items_q.where(CoreDataItem.id.in_(relevant_ids))
-        else:
-            items_q = items_q.where(CoreDataItem.status == StatusEnum.ACTIVE)
 
         items = (await db.execute(items_q)).scalars().all()
         if not items:
@@ -461,13 +467,9 @@ async def build_payload(
                     if sp.relationship_type_to_next else None,
             })
 
-        # INCREMENTAL emits both active and inactive items in changed_connect_item_ids
-        # so an active→inactive flip actually reaches RootsTalk. FULL still emits
-        # only active items — matches the Core-batch pattern above. Before this,
-        # an unconditional status==ACTIVE filter silently dropped deactivations
-        # from INCREMENTAL payloads; the sync_change_log rows still got marked
-        # included (via dispatched_item_ids), so Cosh showed "0 pending" while
-        # RootsTalk kept the row alive. RootsTalk 2026-07-14 flagged this.
+        # Both modes emit every row (active + inactive); status ships on the
+        # item, never inferred from absence. See the matching comment on the
+        # Core-batch query above for the reasoning + history.
         items_q = select(ConnectDataItem).where(
             ConnectDataItem.connect_id == connect_id,
         )
@@ -475,8 +477,6 @@ async def build_payload(
             if not changed_connect_item_ids:
                 continue
             items_q = items_q.where(ConnectDataItem.id.in_(changed_connect_item_ids))
-        else:
-            items_q = items_q.where(ConnectDataItem.status == StatusEnum.ACTIVE)
 
         cdis = (await db.execute(items_q)).scalars().all()
         if not cdis:
