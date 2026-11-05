@@ -713,6 +713,9 @@ async def upload_csv(
     new_item_rows: list[dict] = []
     new_media_rows: list[dict] = []
     new_trans_rows: list[dict] = []
+    # BL-C-07: every item whose translations this CSV wrote or rewrote, so the
+    # sync block below can emit TRANSLATION_UPDATED for pre-existing items.
+    touched_trans_item_ids: set[str] = set()
 
     for i, row in enumerate(rows, start=2):
         english_value = (
@@ -813,6 +816,7 @@ async def upload_csv(
                 })
                 existing_trans_by_key[(item_id_for_row, lang)] = True
             translations_imported += 1
+            touched_trans_item_ids.add(item_id_for_row)
 
     # Bulk-insert in chunks. 5000 rows per statement stays comfortably under
     # asyncpg's ~32k bind-parameter ceiling at our column counts.
@@ -829,6 +833,45 @@ async def upload_csv(
     if new_trans_rows:
         for i in range(0, len(new_trans_rows), INSERT_CHUNK):
             await db.execute(insert(CoreDataTranslation), new_trans_rows[i:i + INSERT_CHUNK])
+
+    # BL-C-07: register the bulk-created items for sync. This path emitted no
+    # sync rows at all — new items only became syncable as a side effect, when
+    # the `retranslate_core` fan-out below happened to fire. A CSV that already
+    # supplied every configured language left `langs_needing_translation` empty,
+    # no task ran, and the items stayed invisible to INCREMENTAL forever.
+    # Bulk-inserted in chunks for the same reason the item rows are (one
+    # round-trip per row blew the nginx 300s timeout on large CSVs).
+    tagged_product_ids = (await db.execute(
+        select(CoreProductTag.product_id).where(CoreProductTag.core_id == core_id)
+    )).scalars().all()
+    if tagged_product_ids:
+        scl_rows: list[dict] = [
+            {
+                "product_id": pid,
+                "entity_type": EntityType.CORE_DATA_ITEM,
+                "entity_id": r["id"],
+                "change_type": ChangeType.ADDED,
+            }
+            for r in new_item_rows
+            for pid in tagged_product_ids
+        ]
+        # CSV-supplied translations on items that already existed: those rows
+        # are an edit, not an add, so they need their own event. New items are
+        # already covered by their ADDED row above.
+        new_item_ids = {r["id"] for r in new_item_rows}
+        translated_existing_ids = touched_trans_item_ids - new_item_ids
+        scl_rows += [
+            {
+                "product_id": pid,
+                "entity_type": EntityType.TRANSLATION,
+                "entity_id": iid,
+                "change_type": ChangeType.TRANSLATION_UPDATED,
+            }
+            for iid in translated_existing_ids
+            for pid in tagged_product_ids
+        ]
+        for i in range(0, len(scl_rows), INSERT_CHUNK):
+            await db.execute(insert(SyncChangeLog), scl_rows[i:i + INSERT_CHUNK])
 
     # Batched Neo4J create — one round trip for all new items.
     if new_item_rows:
@@ -1004,6 +1047,18 @@ async def update_single_translation(
             validated_at=now,
         ))
 
+    # BL-C-07: an expert correction is a change RootsTalk must receive. The
+    # three Celery translation tasks each emit this; this handler did not, so
+    # every manual inline correction was invisible to the sync change table and
+    # never reached any product. Discovered 2026-11-05: a curator's 151 Kannada
+    # corrections across Units / Damage Symptoms / Damage SubSymptoms (2026-11-03)
+    # produced zero sync rows, so INCREMENTAL skipped those Cores entirely —
+    # build_payload `continue`s past a Core with no pending changes, which is
+    # why the Core wasn't even listed as syncable.
+    await write_sync_changes(
+        db, EntityType.TRANSLATION, item_id, ChangeType.TRANSLATION_UPDATED, core_id=core_id
+    )
+
     await db.commit()
     result = await db.execute(
         select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.id == item_id)
@@ -1098,6 +1153,11 @@ async def import_translations_csv(
     updated = 0
     skipped = 0
     errors = []
+    # BL-C-07: items touched by this import, so we can emit one
+    # TRANSLATION_UPDATED per item after the loop. Item-level rather than
+    # per-language, matching retranslate_core — RootsTalk reads the full
+    # translations row when it processes the event.
+    touched_item_ids: set[str] = set()
 
     for row in rows:
         item_id = (row.get("core_data_item_id") or "").strip()
@@ -1144,6 +1204,12 @@ async def import_translations_csv(
                 validated_at=now,
             ))
         updated += 1
+        touched_item_ids.add(item_id)
+
+    for tid in touched_item_ids:
+        await write_sync_changes(
+            db, EntityType.TRANSLATION, tid, ChangeType.TRANSLATION_UPDATED, core_id=core_id
+        )
 
     await db.commit()
 
