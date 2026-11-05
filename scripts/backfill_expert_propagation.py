@@ -23,6 +23,13 @@ import argparse
 import os
 import sys
 
+# This script runs for ~45 minutes and its progress report IS the audit trail.
+# Redirected to a file (nohup ... > log), Python block-buffers stdout, so the
+# log stays empty until the process exits — during the 2026-11-05 run it looked
+# dead for minutes while it was working fine. Force line buffering here rather
+# than relying on whoever invokes it to remember `python -u`.
+sys.stdout.reconfigure(line_buffering=True)
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dotenv import load_dotenv  # noqa: E402
