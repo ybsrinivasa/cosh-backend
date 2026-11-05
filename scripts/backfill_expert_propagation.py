@@ -120,7 +120,12 @@ def main():
             ]
             if not siblings:
                 continue
-            if not args.redo and all(
+            # Resume check: ANY derived sibling means this item has already been
+            # through the propagation — the rest were judged 'ok' and left
+            # alone deliberately. Testing `all` instead would re-run (and
+            # re-charge for) every item where only some languages were wrong,
+            # which is most of them.
+            if not args.redo and any(
                 r.validation_status == ValidationStatus.DERIVED_FROM_EXPERT
                 for r in siblings
             ):
