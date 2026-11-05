@@ -11,7 +11,12 @@ celery_app = Celery(
     "cosh",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.translation", "app.tasks.similarity", "app.tasks.sync"],
+    include=[
+        "app.tasks.translation",
+        "app.tasks.similarity",
+        "app.tasks.sync",
+        "app.tasks.propagate_expert",
+    ],
 )
 
 celery_app.conf.update(
@@ -21,6 +26,10 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_routes={
+        # Shares the translation queue deliberately: both call Anthropic, and
+        # one worker with concurrency 1 keeps us inside the API rate limit
+        # instead of two queues racing into 429s.
+        "app.tasks.propagate_expert.*": {"queue": "translation"},
         "app.tasks.translation.*": {"queue": "translation"},
         "app.tasks.similarity.*": {"queue": "similarity"},
         "app.tasks.sync.*": {"queue": "sync"},

@@ -1060,6 +1060,15 @@ async def update_single_translation(
     )
 
     await db.commit()
+
+    # An expert correction tells us the machine misread the ENGLISH, and the
+    # other languages came from that same English — so they likely carry the
+    # same error. Push the corrected reading out to them. Debounced by 30s on
+    # the task side, so a burst of edits to one row costs one run.
+    from app.tasks.propagate_expert import schedule_propagation
+
+    schedule_propagation(item_id, lang_code, now)
+
     result = await db.execute(
         select(CoreDataItem).options(selectinload(CoreDataItem.translations)).where(CoreDataItem.id == item_id)
     )
@@ -1158,6 +1167,11 @@ async def import_translations_csv(
     # per-language, matching retranslate_core — RootsTalk reads the full
     # translations row when it processes the event.
     touched_item_ids: set[str] = set()
+    # One timestamp for the whole import. Must be shared: it is written to
+    # every row AND handed to schedule_propagation as the debounce token, so a
+    # per-row value would make the token mismatch for all but the last row.
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
 
     for row in rows:
         item_id = (row.get("core_data_item_id") or "").strip()
@@ -1186,9 +1200,6 @@ async def import_translations_csv(
             )
         )).scalar_one_or_none()
 
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
-
         if existing:
             existing.translated_value = translated_value
             existing.validation_status = ValidationStatus.EXPERT_VALIDATED
@@ -1212,6 +1223,15 @@ async def import_translations_csv(
         )
 
     await db.commit()
+
+    # Same propagation as the inline editor — a CSV round-trip is the other way
+    # experts deliver corrections. One run per item; the 30s countdown plus the
+    # staleness token collapses duplicates if the same CSV is re-imported.
+    if touched_item_ids:
+        from app.tasks.propagate_expert import schedule_propagation
+
+        for tid in touched_item_ids:
+            schedule_propagation(tid, lang, now)
 
     return {
         "total_rows": len(rows),

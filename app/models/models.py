@@ -45,6 +45,13 @@ class LanguageMode(str, enum.Enum):
 class ValidationStatus(str, enum.Enum):
     MACHINE_GENERATED = "MACHINE_GENERATED"
     EXPERT_VALIDATED = "EXPERT_VALIDATED"
+    # Re-derived from an expert's correction in a SIBLING language. Still
+    # machine output — nobody has read it in this language — but produced with
+    # the meaning the expert pinned down, so strictly better informed than
+    # MACHINE_GENERATED. Kept distinct so you can audit what the propagation
+    # touched, and so a later propagation run can safely overwrite it while
+    # never overwriting EXPERT_VALIDATED.
+    DERIVED_FROM_EXPERT = "DERIVED_FROM_EXPERT"
 
 
 class SyncMode(str, enum.Enum):
